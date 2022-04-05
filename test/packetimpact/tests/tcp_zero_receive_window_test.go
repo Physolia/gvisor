@@ -31,7 +31,10 @@ func init() {
 
 // TestZeroReceiveWindow tests if the DUT sends a zero receive window eventually.
 func TestZeroReceiveWindow(t *testing.T) {
-	for _, payloadLen := range []int{64, 512, 1024} {
+	// 75 is the smallest size we can use for a payload in this test. Any smaller
+	// than this and the receive buffer will fill up before the receive window
+	// can shrink to zero.
+	for _, payloadLen := range []int{75, 512, 1024} {
 		t.Run(fmt.Sprintf("TestZeroReceiveWindow_with_%dbytes_payload", payloadLen), func(t *testing.T) {
 			dut := testbench.NewDUT(t)
 			listenFd, remotePort := dut.CreateListener(t, unix.SOCK_STREAM, unix.IPPROTO_TCP, 1)

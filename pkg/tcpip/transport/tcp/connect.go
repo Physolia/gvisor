@@ -22,7 +22,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sleep"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/hash/jenkins"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/seqnum"
@@ -224,7 +223,7 @@ func (h *handshake) checkAck(s *segment) bool {
 		//   If the segment acknowledgment is not acceptable, form a reset segment,
 		//        <SEQ=SEG.ACK><CTL=RST>
 		//   and send it.
-		h.ep.sendRaw(buffer.VectorisedView{}, header.TCPFlagRst, s.ackNumber, 0, 0)
+		h.ep.sendEmptyRaw(header.TCPFlagRst, s.ackNumber, 0, 0)
 		return false
 	}
 
@@ -281,7 +280,7 @@ func (h *handshake) synSentState(s *segment) tcpip.Error {
 		h.state = handshakeCompleted
 		h.transitionToStateEstablishedLocked(s)
 
-		h.ep.sendRaw(buffer.VectorisedView{}, header.TCPFlagAck, h.iss+1, h.ackNum, h.rcvWnd>>h.effectiveRcvWndScale())
+		h.ep.sendEmptyRaw(header.TCPFlagAck, h.iss+1, h.ackNum, h.rcvWnd>>h.effectiveRcvWndScale())
 		return nil
 	}
 
@@ -342,7 +341,7 @@ func (h *handshake) synRcvdState(s *segment) tcpip.Error {
 	// segment and return."
 	if !s.sequenceNumber.InWindow(h.ackNum, h.rcvWnd) {
 		if h.ep.allowOutOfWindowAck() {
-			h.ep.sendRaw(buffer.VectorisedView{}, header.TCPFlagAck, h.iss+1, h.ackNum, h.rcvWnd)
+			h.ep.sendEmptyRaw(header.TCPFlagAck, h.iss+1, h.ackNum, h.rcvWnd)
 		}
 		return nil
 	}
@@ -356,7 +355,7 @@ func (h *handshake) synRcvdState(s *segment) tcpip.Error {
 		if s.flags.Contains(header.TCPFlagAck) {
 			seq = s.ackNumber
 		}
-		h.ep.sendRaw(buffer.VectorisedView{}, header.TCPFlagRst|header.TCPFlagAck, seq, ack, 0)
+		h.ep.sendEmptyRaw(header.TCPFlagRst|header.TCPFlagAck, seq, ack, 0)
 
 		if !h.active {
 			return &tcpip.ErrInvalidEndpointState{}
@@ -388,7 +387,7 @@ func (h *handshake) synRcvdState(s *segment) tcpip.Error {
 	if s.flags.Contains(header.TCPFlagAck) {
 		// If deferAccept is not zero and this is a bare ACK and the
 		// timeout is not hit then drop the ACK.
-		if h.deferAccept != 0 && s.data.Size() == 0 && h.ep.stack.Clock().NowMonotonic().Sub(h.startTime) < h.deferAccept {
+		if h.deferAccept != 0 && s.payloadSize() == 0 && h.ep.stack.Clock().NowMonotonic().Sub(h.startTime) < h.deferAccept {
 			h.acked = true
 			h.ep.stack.Stats().DroppedPackets.Increment()
 			return nil
@@ -422,7 +421,7 @@ func (h *handshake) synRcvdState(s *segment) tcpip.Error {
 
 		// Requeue the segment if the ACK completing the handshake has more info
 		// to be procesed by the newly established endpoint.
-		if (s.flags.Contains(header.TCPFlagFin) || s.data.Size() > 0) && h.ep.enqueueSegment(s) {
+		if (s.flags.Contains(header.TCPFlagFin) || s.payloadSize() > 0) && h.ep.enqueueSegment(s) {
 			h.ep.newSegmentWaker.Assert()
 		}
 		return nil
@@ -778,16 +777,18 @@ type tcpFields struct {
 func (e *endpoint) sendSynTCP(r *stack.Route, tf tcpFields, opts header.TCPSynOptions) tcpip.Error {
 	tf.opts = makeSynOptions(opts)
 	// We ignore SYN send errors and let the callers re-attempt send.
-	if err := e.sendTCP(r, tf, buffer.VectorisedView{}, stack.GSO{}); err != nil {
+	p := stack.NewPacketBuffer(stack.PacketBufferOptions{})
+	defer p.DecRef()
+	if err := e.sendTCP(r, tf, p, stack.GSO{}); err != nil {
 		e.stats.SendErrors.SynSendToNetworkFailed.Increment()
 	}
 	putOptions(tf.opts)
 	return nil
 }
 
-func (e *endpoint) sendTCP(r *stack.Route, tf tcpFields, data buffer.VectorisedView, gso stack.GSO) tcpip.Error {
+func (e *endpoint) sendTCP(r *stack.Route, tf tcpFields, pkt *stack.PacketBuffer, gso stack.GSO) tcpip.Error {
 	tf.txHash = e.txHash
-	if err := sendTCP(r, tf, data, gso, e.owner); err != nil {
+	if err := sendTCP(r, tf, pkt, gso, e.owner); err != nil {
 		e.stats.SendErrors.SegmentSendToNetworkFailed.Increment()
 		return err
 	}
@@ -824,22 +825,15 @@ func buildTCPHdr(r *stack.Route, tf tcpFields, pkt *stack.PacketBuffer, gso stac
 	}
 }
 
-func sendTCPBatch(r *stack.Route, tf tcpFields, data buffer.VectorisedView, gso stack.GSO, owner tcpip.PacketOwner) tcpip.Error {
-	// We need to shallow clone the VectorisedView here as ReadToView will
-	// split the VectorisedView and Trim underlying views as it splits. Not
-	// doing the clone here will cause the underlying views of data itself
-	// to be altered.
-	data = data.Clone(nil)
-
+func sendTCPBatch(r *stack.Route, tf tcpFields, pkt *stack.PacketBuffer, gso stack.GSO, owner tcpip.PacketOwner) tcpip.Error {
 	optLen := len(tf.opts)
 	if tf.rcvWnd > math.MaxUint16 {
 		tf.rcvWnd = math.MaxUint16
 	}
 
 	mss := int(gso.MSS)
-	n := (data.Size() + mss - 1) / mss
-
-	size := data.Size()
+	n := (pkt.Data().Size() + mss - 1) / mss
+	size := pkt.Data().Size()
 	hdrSize := header.TCPMinimumSize + int(r.MaxHeaderLength()) + optLen
 	for i := 0; i < n; i++ {
 		packetSize := mss
@@ -847,49 +841,63 @@ func sendTCPBatch(r *stack.Route, tf tcpFields, data buffer.VectorisedView, gso 
 			packetSize = size
 		}
 		size -= packetSize
-		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-			ReserveHeaderBytes: hdrSize,
-		})
-		pkt.Hash = tf.txHash
-		pkt.Owner = owner
-		pkt.Data().ReadFromVV(&data, packetSize)
-		buildTCPHdr(r, tf, pkt, gso)
+
+		finalIter := i == n-1
+		var splitPkt *stack.PacketBuffer
+		if finalIter {
+			// No need to create a new pb in the final iteration, clone already has
+			// the truncated data.
+			splitPkt = pkt
+		} else {
+			splitPkt = stack.NewPacketBuffer(stack.PacketBufferOptions{ReserveHeaderBytes: hdrSize})
+			splitPkt.Data().ReadFrom(pkt.Data(), packetSize)
+		}
+
+		splitPkt.Hash = tf.txHash
+		splitPkt.Owner = owner
+		buildTCPHdr(r, tf, splitPkt, gso)
 		tf.seq = tf.seq.Add(seqnum.Size(packetSize))
-		pkt.GSOOptions = gso
-		if err := r.WritePacket(stack.NetworkHeaderParams{Protocol: ProtocolNumber, TTL: tf.ttl, TOS: tf.tos}, pkt); err != nil {
+		splitPkt.GSOOptions = gso
+		if err := r.WritePacket(stack.NetworkHeaderParams{Protocol: ProtocolNumber, TTL: tf.ttl, TOS: tf.tos}, splitPkt); err != nil {
 			r.Stats().TCP.SegmentSendErrors.Increment()
-			pkt.DecRef()
+			if !finalIter {
+				splitPkt.DecRef()
+			}
 			return err
 		}
 		r.Stats().TCP.SegmentsSent.Increment()
-		pkt.DecRef()
+		if !finalIter {
+			splitPkt.DecRef()
+		}
 	}
 	return nil
 }
 
 // sendTCP sends a TCP segment with the provided options via the provided
 // network endpoint and under the provided identity.
-func sendTCP(r *stack.Route, tf tcpFields, data buffer.VectorisedView, gso stack.GSO, owner tcpip.PacketOwner) tcpip.Error {
+func sendTCP(r *stack.Route, tf tcpFields, pkt *stack.PacketBuffer, gso stack.GSO, owner tcpip.PacketOwner) tcpip.Error {
 	optLen := len(tf.opts)
 	if tf.rcvWnd > math.MaxUint16 {
 		tf.rcvWnd = math.MaxUint16
 	}
+	// We need to create a new packet because WritePacket takes ownership and pkt
+	// may be held by a segment that processed later on.
+	sendPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		ReserveHeaderBytes: header.TCPMinimumSize + int(r.MaxHeaderLength()) + optLen,
+	})
+	sendPkt.Data().AppendView(pkt.Data().AsRange().AsView())
+	defer sendPkt.DecRef()
 
-	if r.Loop()&stack.PacketLoop == 0 && gso.Type == stack.GSOSW && int(gso.MSS) < data.Size() {
-		return sendTCPBatch(r, tf, data, gso, owner)
+	if r.Loop()&stack.PacketLoop == 0 && gso.Type == stack.GSOSW && int(gso.MSS) < sendPkt.Data().Size() {
+		return sendTCPBatch(r, tf, sendPkt, gso, owner)
 	}
 
-	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-		ReserveHeaderBytes: header.TCPMinimumSize + int(r.MaxHeaderLength()) + optLen,
-		Data:               data,
-	})
-	defer pkt.DecRef()
-	pkt.GSOOptions = gso
-	pkt.Hash = tf.txHash
-	pkt.Owner = owner
-	buildTCPHdr(r, tf, pkt, gso)
+	sendPkt.GSOOptions = gso
+	sendPkt.Hash = tf.txHash
+	sendPkt.Owner = owner
+	buildTCPHdr(r, tf, sendPkt, gso)
 
-	if err := r.WritePacket(stack.NetworkHeaderParams{Protocol: ProtocolNumber, TTL: tf.ttl, TOS: tf.tos}, pkt); err != nil {
+	if err := r.WritePacket(stack.NetworkHeaderParams{Protocol: ProtocolNumber, TTL: tf.ttl, TOS: tf.tos}, sendPkt); err != nil {
 		r.Stats().TCP.SegmentSendErrors.Increment()
 		return err
 	}
@@ -939,8 +947,15 @@ func (e *endpoint) makeOptions(sackBlocks []header.SACKBlock) []byte {
 	return options[:offset]
 }
 
+// sendEmptyRaw sends a TCP segment to the endpoint's peer.
+func (e *endpoint) sendEmptyRaw(flags header.TCPFlags, seq, ack seqnum.Value, rcvWnd seqnum.Size) tcpip.Error {
+	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{})
+	defer pkt.DecRef()
+	return e.sendRaw(pkt, flags, seq, ack, rcvWnd)
+}
+
 // sendRaw sends a TCP segment to the endpoint's peer.
-func (e *endpoint) sendRaw(data buffer.VectorisedView, flags header.TCPFlags, seq, ack seqnum.Value, rcvWnd seqnum.Size) tcpip.Error {
+func (e *endpoint) sendRaw(pkt *stack.PacketBuffer, flags header.TCPFlags, seq, ack seqnum.Value, rcvWnd seqnum.Size) tcpip.Error {
 	var sackBlocks []header.SACKBlock
 	if e.EndpointState() == StateEstablished && e.rcv.pendingRcvdSegments.Len() > 0 && (flags&header.TCPFlagAck != 0) {
 		sackBlocks = e.sack.Blocks[:e.sack.NumBlocks]
@@ -955,7 +970,7 @@ func (e *endpoint) sendRaw(data buffer.VectorisedView, flags header.TCPFlags, se
 		ack:    ack,
 		rcvWnd: rcvWnd,
 		opts:   options,
-	}, data, e.gso)
+	}, pkt, e.gso)
 	putOptions(options)
 	return err
 }
@@ -1000,7 +1015,7 @@ func (e *endpoint) resetConnectionLocked(err tcpip.Error) {
 		if !sndWndEnd.LessThan(e.snd.SndNxt) || e.snd.SndNxt.Size(sndWndEnd) < (1<<e.snd.SndWndScale) {
 			resetSeqNum = e.snd.SndNxt
 		}
-		e.sendRaw(buffer.VectorisedView{}, header.TCPFlagAck|header.TCPFlagRst, resetSeqNum, e.rcv.RcvNxt, 0)
+		e.sendEmptyRaw(header.TCPFlagAck|header.TCPFlagRst, resetSeqNum, e.rcv.RcvNxt, 0)
 	}
 	// Don't purge read queues here. If there's buffered data, it's still allowed
 	// to be read.
@@ -1305,7 +1320,7 @@ func (e *endpoint) keepaliveTimerExpired() tcpip.Error {
 	// seg.seq = snd.nxt-1.
 	e.keepalive.unacked++
 	e.keepalive.Unlock()
-	e.snd.sendSegmentFromView(buffer.VectorisedView{}, header.TCPFlagAck, e.snd.SndNxt-1)
+	e.snd.sendEmptySegment(header.TCPFlagAck, e.snd.SndNxt-1)
 	e.resetKeepaliveTimer(false)
 	return nil
 }

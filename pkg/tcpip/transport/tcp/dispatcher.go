@@ -178,9 +178,10 @@ func (d *dispatcher) wait() {
 func (d *dispatcher) queuePacket(stackEP stack.TransportEndpoint, id stack.TransportEndpointID, clock tcpip.Clock, pkt *stack.PacketBuffer) {
 	ep := stackEP.(*endpoint)
 
+	hdr := header.TCP(pkt.TransportHeader().View())
 	s := newIncomingSegment(id, clock, pkt)
 	defer s.DecRef()
-	if !s.parse(pkt.RXTransportChecksumValidated) {
+	if !s.parse(hdr, pkt.RXTransportChecksumValidated) {
 		ep.stack.Stats().TCP.InvalidSegmentsReceived.Increment()
 		ep.stats.ReceiveErrors.MalformedPacketsReceived.Increment()
 		return

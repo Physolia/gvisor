@@ -157,10 +157,11 @@ func (p *protocol) QueuePacket(ep stack.TransportEndpoint, id stack.TransportEnd
 // particular, SYNs addressed to a non-existent connection are rejected by this
 // means."
 func (p *protocol) HandleUnknownDestinationPacket(id stack.TransportEndpointID, pkt *stack.PacketBuffer) stack.UnknownDestinationPacketDisposition {
+	hdr := header.TCP(pkt.TransportHeader().View())
 	s := newIncomingSegment(id, p.stack.Clock(), pkt)
 	defer s.DecRef()
 
-	if !s.parse(pkt.RXTransportChecksumValidated) || !s.csumValid {
+	if !s.parse(hdr, pkt.RXTransportChecksumValidated) || !s.csumValid {
 		return stack.UnknownDestinationPacketMalformed
 	}
 
@@ -224,6 +225,8 @@ func replyWithReset(st *stack.Stack, s *segment, tos, ipv4TTL uint8, ipv6HopLimi
 		ack = s.sequenceNumber.Add(s.logicalLen())
 	}
 
+	p := stack.NewPacketBuffer(stack.PacketBufferOptions{})
+	defer p.DecRef()
 	return sendTCP(route, tcpFields{
 		id:     s.id,
 		ttl:    ttl,
@@ -232,7 +235,7 @@ func replyWithReset(st *stack.Stack, s *segment, tos, ipv4TTL uint8, ipv6HopLimi
 		seq:    seq,
 		ack:    ack,
 		rcvWnd: 0,
-	}, buffer.VectorisedView{}, stack.GSO{}, nil /* PacketOwner */)
+	}, p, stack.GSO{}, nil /* PacketOwner */)
 }
 
 // SetOption implements stack.TransportProtocol.SetOption.

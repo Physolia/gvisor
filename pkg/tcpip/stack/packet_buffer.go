@@ -108,7 +108,7 @@ type PacketBuffer struct {
 
 	// buf is the underlying buffer for the packet. See struct level docs for
 	// details.
-	buf      buffer.Buffer
+	buf      buffer.Buffer `state:".([]byte)"`
 	reserved int
 	pushed   int
 	consumed int
@@ -253,7 +253,7 @@ func (pk *PacketBuffer) Size() int {
 // MemSize returns the estimation size of the pk in memory, including backing
 // buffer data.
 func (pk *PacketBuffer) MemSize() int {
-	return int(pk.buf.Size()) + packetBufferStructSize
+	return int(pk.buf.Size()) + PacketBufferStructSize
 }
 
 // Data returns the handle to data portion of pk.
@@ -572,6 +572,23 @@ func (d PacketData) ReadFromVV(srcVV *tcpipbuffer.VectorisedView, count int) int
 	}
 	srcVV.TrimFront(done)
 	return done
+}
+
+// ReadFrom moves at most count bytes from the beginning of src to the end
+// of d.
+func (d PacketData) ReadFrom(src PacketData, count int) {
+	r := Range{
+		pk:     src.pk,
+		offset: src.pk.dataOffset(),
+		length: count,
+	}
+	d.AppendView(r.AsView())
+	src.pk.buf.TrimFront(int64(count))
+}
+
+// TrimFront removes count bytes from the front of d.
+func (d PacketData) TrimFront(count int64) {
+	d.pk.buf.TrimFront(count)
 }
 
 // Size returns the number of bytes in the data payload of the packet.

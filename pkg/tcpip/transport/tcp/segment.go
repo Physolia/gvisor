@@ -29,7 +29,11 @@ import (
 type queueFlags uint8
 
 const (
-	recvQ queueFlags = 1 << iota
+	// SegOverheadSize is the size of an empty seg in memory including packet
+	// buffer overhead. It is advised to used SegOverheadSize instead of segSize
+	// in all cases where accounting for segment memory overhead is important.
+	SegOverheadSize            = segSize + stack.PacketBufferStructSize
+	recvQ           queueFlags = 1 << iota
 	sendQ
 )
 
@@ -53,12 +57,8 @@ type segment struct {
 	netProto tcpip.NetworkProtocolNumber
 	nicID    tcpip.NICID
 
-	data buffer.VectorisedView `state:".(buffer.VectorisedView)"`
+	pkt *stack.PacketBuffer
 
-	hdr header.TCP
-	// views is used as buffer for data when its length is large
-	// enough to store a VectorisedView.
-	views          [8]buffer.View `state:"nosave"`
 	sequenceNumber seqnum.Value
 	ackNumber      seqnum.Value
 	flags          header.TCPFlags
@@ -97,10 +97,10 @@ func newIncomingSegment(id stack.TransportEndpointID, clock tcpip.Clock, pkt *st
 		nicID:    pkt.NICID,
 	}
 	s.InitRefs()
-	s.data = pkt.Data().ExtractVV().Clone(s.views[:])
-	s.hdr = header.TCP(pkt.TransportHeader().View())
+	pkt.IncRef()
+	s.pkt = pkt
 	s.rcvdTime = clock.NowMonotonic()
-	s.dataMemSize = s.data.Size()
+	s.dataMemSize = s.pkt.MemSize()
 	return s
 }
 
@@ -110,14 +110,13 @@ func newOutgoingSegment(id stack.TransportEndpointID, clock tcpip.Clock, v buffe
 	}
 	s.InitRefs()
 	s.rcvdTime = clock.NowMonotonic()
-	if len(v) != 0 {
-		s.views[0] = v
-		s.data = buffer.NewVectorisedView(len(v), s.views[:1])
-	}
-	s.dataMemSize = s.data.Size()
+	s.pkt = stack.NewPacketBuffer(stack.PacketBufferOptions{})
+	s.pkt.Data().AppendView(v)
+	s.dataMemSize = s.pkt.MemSize()
 	return s
 }
 
+// clone creates a shallow clone of s not including its pkt.
 func (s *segment) clone() *segment {
 	t := &segment{
 		id:             s.id,
@@ -135,17 +134,15 @@ func (s *segment) clone() *segment {
 		dataMemSize:    s.dataMemSize,
 	}
 	t.InitRefs()
-	t.data = s.data.Clone(t.views[:])
+	t.pkt = stack.NewPacketBuffer(stack.PacketBufferOptions{})
 	return t
 }
 
 // merge merges data in oth and clears oth.
 func (s *segment) merge(oth *segment) {
-	s.data.Append(oth.data)
-	s.dataMemSize = s.data.Size()
-
-	oth.data = buffer.VectorisedView{}
-	oth.dataMemSize = oth.data.Size()
+	s.pkt.Data().ReadFrom(oth.pkt.Data(), oth.pkt.Data().Size())
+	s.dataMemSize = s.pkt.MemSize()
+	oth.dataMemSize = oth.pkt.MemSize()
 }
 
 // setOwner sets the owning endpoint for this segment. Its required
@@ -176,13 +173,14 @@ func (s *segment) DecRef() {
 				panic(fmt.Sprintf("unexpected queue flag %b set for segment", s.qFlags))
 			}
 		}
+		s.pkt.DecRef()
 	})
 }
 
 // logicalLen is the segment length in the sequence number space. It's defined
 // as the data length plus one for each of the SYN and FIN bits set.
 func (s *segment) logicalLen() seqnum.Size {
-	l := seqnum.Size(s.data.Size())
+	l := seqnum.Size(s.payloadSize())
 	if s.flags.Contains(header.TCPFlagSyn) {
 		l++
 	}
@@ -194,25 +192,24 @@ func (s *segment) logicalLen() seqnum.Size {
 
 // payloadSize is the size of s.data.
 func (s *segment) payloadSize() int {
-	return s.data.Size()
+	return s.pkt.Data().Size()
 }
 
 // segMemSize is the amount of memory used to hold the segment data and
 // the associated metadata.
 func (s *segment) segMemSize() int {
-	return SegSize + s.dataMemSize
+	return segSize + s.dataMemSize
 }
 
 // parse populates the sequence & ack numbers, flags, and window fields of the
-// segment from the TCP header stored in the data. It then updates the view to
-// skip the header.
+// segment from a TCP header. It then updates the view to skip the header.
 //
 // Returns boolean indicating if the parsing was successful.
 //
 // If checksum verification may not be skipped, parse also verifies the
 // TCP checksum and stores the checksum and result of checksum verification in
 // the csum and csumValid fields of the segment.
-func (s *segment) parse(skipChecksumValidation bool) bool {
+func (s *segment) parse(hdr header.TCP, skipChecksumValidation bool) bool {
 	// h is the header followed by the payload. We check that the offset to
 	// the data respects the following constraints:
 	// 1. That it's at least the minimum header size; if we don't do this
@@ -223,25 +220,25 @@ func (s *segment) parse(skipChecksumValidation bool) bool {
 	// N.B. The segment has already been validated as having at least the
 	//      minimum TCP size before reaching here, so it's safe to read the
 	//      fields.
-	offset := int(s.hdr.DataOffset())
-	if offset < header.TCPMinimumSize || offset > len(s.hdr) {
+	offset := int(hdr.DataOffset())
+	if offset < header.TCPMinimumSize || offset > len(hdr) {
 		return false
 	}
 
-	s.options = s.hdr[header.TCPMinimumSize:]
+	s.options = hdr[header.TCPMinimumSize:]
 	s.parsedOptions = header.ParseTCPOptions(s.options)
 	if skipChecksumValidation {
 		s.csumValid = true
 	} else {
-		s.csum = s.hdr.Checksum()
-		payloadChecksum := header.ChecksumVV(s.data, 0)
-		payloadLength := uint16(s.data.Size())
-		s.csumValid = s.hdr.IsChecksumValid(s.srcAddr, s.dstAddr, payloadChecksum, payloadLength)
+		s.csum = hdr.Checksum()
+		payloadChecksum := s.pkt.Data().AsRange().Checksum()
+		payloadLength := uint16(s.payloadSize())
+		s.csumValid = hdr.IsChecksumValid(s.srcAddr, s.dstAddr, payloadChecksum, payloadLength)
 	}
-	s.sequenceNumber = seqnum.Value(s.hdr.SequenceNumber())
-	s.ackNumber = seqnum.Value(s.hdr.AckNumber())
-	s.flags = s.hdr.Flags()
-	s.window = seqnum.Size(s.hdr.WindowSize())
+	s.sequenceNumber = seqnum.Value(hdr.SequenceNumber())
+	s.ackNumber = seqnum.Value(hdr.AckNumber())
+	s.flags = hdr.Flags()
+	s.window = seqnum.Size(hdr.WindowSize())
 	return true
 }
 
