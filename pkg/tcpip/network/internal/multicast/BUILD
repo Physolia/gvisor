@@ -1,0 +1,32 @@
+load("//tools:defs.bzl", "go_library", "go_test")
+
+package(licenses = ["notice"])
+
+go_library(
+    name = "multicast",
+    srcs = [
+        "route_table.go",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/tcpip",
+        "//pkg/tcpip/stack",
+    ],
+)
+
+go_test(
+    name = "route_table_test",
+    size = "small",
+    srcs = [
+        "route_table_test.go",
+    ],
+    library = ":multicast",
+    deps = [
+        "//pkg/tcpip",
+        "//pkg/tcpip/buffer",
+        "//pkg/tcpip/faketime",
+        "//pkg/tcpip/stack",
+        "//pkg/tcpip/testutil",
+        "@com_github_google_go_cmp//cmp:go_default_library",
+    ],
+)
