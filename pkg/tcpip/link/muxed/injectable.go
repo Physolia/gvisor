@@ -80,7 +80,7 @@ func (m *InjectableEndpoint) IsAttached() bool {
 }
 
 // InjectInbound implements stack.InjectableLinkEndpoint.
-func (m *InjectableEndpoint) InjectInbound(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
+func (m *InjectableEndpoint) InjectInbound(protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr) {
 	m.dispatcher.DeliverNetworkPacket(protocol, pkt)
 }
 
@@ -89,9 +89,7 @@ func (m *InjectableEndpoint) InjectInbound(protocol tcpip.NetworkProtocolNumber,
 // pkt.EgressRoute.RemoteAddress has a route registered in this endpoint.
 func (m *InjectableEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
 	i := 0
-	for pkt := pkts.Front(); pkt != nil; {
-		nextPkt := pkt.Next()
-
+	for _, pkt := range pkts.AsSlice() {
 		endpoint, ok := m.routes[pkt.EgressRoute.RemoteAddress]
 		if !ok {
 			return i, &tcpip.ErrNoRoute{}
@@ -106,7 +104,6 @@ func (m *InjectableEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcp
 		}
 
 		i += n
-		pkt = nextPkt
 	}
 
 	return i, nil
@@ -135,7 +132,7 @@ func (*InjectableEndpoint) ARPHardwareType() header.ARPHardwareType {
 }
 
 // AddHeader implements stack.LinkEndpoint.AddHeader.
-func (*InjectableEndpoint) AddHeader(*stack.PacketBuffer) {}
+func (*InjectableEndpoint) AddHeader(stack.PacketBufferPtr) {}
 
 // NewInjectableEndpoint creates a new multi-endpoint injectable endpoint.
 func NewInjectableEndpoint(routes map[tcpip.Address]stack.InjectableLinkEndpoint) *InjectableEndpoint {

@@ -98,7 +98,8 @@ func (qd *queueDispatcher) dispatchLoop() {
 		case &qd.newPacketWaker:
 		case &qd.closeWaker:
 			qd.mu.Lock()
-			for p := qd.queue.Front(); p != nil; p = qd.queue.Front() {
+			// TODO: This is a problem. Yay!
+			for _, p := range qd.queue.AsSlice() {
 				qd.queue.Remove(p)
 				p.DecRef()
 				qd.used--
@@ -110,7 +111,8 @@ func (qd *queueDispatcher) dispatchLoop() {
 			panic("unknown waker")
 		}
 		qd.mu.Lock()
-		for pkt := qd.queue.Front(); pkt != nil; pkt = qd.queue.Front() {
+		// TODO: This is a problem. Yay!
+		for _, pkt := range qd.queue.AsSlice() {
 			qd.queue.Remove(pkt)
 			qd.used--
 			batch.PushBack(pkt)
@@ -133,7 +135,7 @@ func (qd *queueDispatcher) dispatchLoop() {
 //  - pkt.EgressRoute
 //  - pkt.GSOOptions
 //  - pkt.NetworkProtocolNumber
-func (d *discipline) WritePacket(pkt *stack.PacketBuffer) tcpip.Error {
+func (d *discipline) WritePacket(pkt stack.PacketBufferPtr) tcpip.Error {
 	if atomic.LoadInt32(&d.closed) == qDiscClosed {
 		return &tcpip.ErrClosedForSend{}
 	}
@@ -141,8 +143,8 @@ func (d *discipline) WritePacket(pkt *stack.PacketBuffer) tcpip.Error {
 	qd.mu.Lock()
 	haveSpace := qd.used < qd.limit
 	if haveSpace {
-		pkt.IncRef()
-		qd.queue.PushBack(pkt)
+		incPkt := pkt.IncRef()
+		qd.queue.PushBack(incPkt)
 		qd.used++
 	}
 	qd.mu.Unlock()
