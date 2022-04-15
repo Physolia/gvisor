@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package checkaligned ensures that atomic (u)int64 operations happen
+// Package checkaligned ensures that atomic (u)int operations happen
 // exclusively via the atomicbitops package.
 package checkaligned
 
 import (
 	"fmt"
 	"go/ast"
+	"strings"
 
 	"golang.org/x/tools/go/analysis"
 )
@@ -26,7 +27,7 @@ import (
 // Analyzer defines the entrypoint.
 var Analyzer = &analysis.Analyzer{
 	Name: "checkaligned",
-	Doc:  "prohibits direct use of 64 bit atomic operations",
+	Doc:  "prohibits direct use of atomic int operations",
 	Run:  run,
 }
 
@@ -45,12 +46,30 @@ var blocklist = []string{
 	"StoreUint64",
 	"SwapInt64",
 	"SwapUint64",
+
+	"AddInt32",
+	"AddUint32",
+	"CompareAndSwapInt32",
+	"CompareAndSwapUint32",
+	"LoadInt32",
+	"LoadUint32",
+	"StoreInt32",
+	"StoreUint32",
+	"SwapInt32",
+	"SwapUint32",
 }
 
 func run(pass *analysis.Pass) (interface{}, error) {
-	// atomicbitops uses 64 bit values safely.
-	if pass.Pkg.Name() == "atomicbitops" {
-		return nil, nil
+	// We support a "// +checkalignedignore" escape hatch in the package comment.
+	for _, file := range pass.Files {
+		if file.Doc == nil {
+			continue
+		}
+		for _, comment := range file.Doc.List {
+			if len(comment.Text) > 2 && strings.HasPrefix(comment.Text[2:], " +checkalignedignore") {
+				return nil, nil
+			}
+		}
 	}
 
 	for _, file := range pass.Files {
