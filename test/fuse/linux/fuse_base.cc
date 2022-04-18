@@ -149,13 +149,20 @@ void FuseTest::SetServerInodeLookup(const std::string& path, mode_t mode,
   WaitServerComplete();
 }
 
-void FuseTest::MountFuse(const char* mountOpts) {
-  EXPECT_THAT(dev_fd_ = open("/dev/fuse", O_RDWR), SyscallSucceeds());
+void FuseTest::MountFuse(const char* mount_opts) {
+  int dev_fd;
+  EXPECT_THAT(dev_fd = open("/dev/fuse", O_RDWR), SyscallSucceeds());
+  std::string fmt_mount_opts = absl::StrFormat("fd=%d,%s", dev_fd, mount_opts);
+  TempPath mount_point = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  MountFuse(dev_fd, mount_point, fmt_mount_opts.c_str());
+}
 
-  std::string mount_opts = absl::StrFormat("fd=%d,%s", dev_fd_, mountOpts);
-  mount_point_ = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+void FuseTest::MountFuse(int fd, TempPath& mount_point,
+                         const char* mount_opts) {
+  mount_point_ = std::move(mount_point);
+  dev_fd_ = fd;
   EXPECT_THAT(mount("fuse", mount_point_.path().c_str(), "fuse",
-                    MS_NODEV | MS_NOSUID, mount_opts.c_str()),
+                    MS_NODEV | MS_NOSUID, mount_opts),
               SyscallSucceeds());
 }
 
