@@ -19,7 +19,6 @@ package kernel
 import (
 	"fmt"
 	"math/rand"
-	"sync/atomic"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -134,9 +133,9 @@ func (t *Task) accountTaskGoroutineEnter(state TaskGoroutineState) {
 }
 
 // Preconditions:
-// * The caller must be running on the task goroutine
-// * The caller must be leaving a state indicated by a previous call to
-//   t.accountTaskGoroutineEnter(state).
+//   - The caller must be running on the task goroutine
+//   - The caller must be leaving a state indicated by a previous call to
+//     t.accountTaskGoroutineEnter(state).
 func (t *Task) accountTaskGoroutineLeave(state TaskGoroutineState) {
 	if state != TaskGoroutineRunningApp {
 		// Task is unblocking/continuing.
@@ -205,7 +204,7 @@ func (tg *ThreadGroup) CPUStats() usage.CPUStats {
 }
 
 // Preconditions: Same as TaskGoroutineSchedInfo.userTicksAt, plus:
-// * The TaskSet mutex must be locked.
+//   - The TaskSet mutex must be locked.
 func (tg *ThreadGroup) cpuStatsAtLocked(now uint64) usage.CPUStats {
 	stats := tg.exitedCPUStats
 	// Account for live tasks.
@@ -336,140 +335,129 @@ func (tg *ThreadGroup) CPUClock() ktime.Clock {
 	return &tgClock{tg: tg, includeSys: true}
 }
 
-type kernelCPUClockTicker struct {
-	k *Kernel
+func (k *Kernel) runCPUClockTicker() {
+	rng := rand.New(rand.NewSource(rand.Int63()))
+	var tgs []*ThreadGroup
 
-	// These are essentially kernelCPUClockTicker.Notify local variables that
-	// are cached between calls to reduce allocations.
-	rng *rand.Rand
-	tgs []*ThreadGroup
-}
+	for {
+		// Stop the CPU clock while nothing is running.
+		if k.runningTasks.Load() == 0 {
+			k.runningTasksMu.Lock()
+			if k.runningTasks.Load() == 0 {
+				k.cpuClockTickerRunning = false
+				k.cpuClockTickerStopCond.Broadcast()
+				k.runningTasksCond.Wait()
+				// k.cpuClockTickerRunning was set to true by our waker
+				// (Kernel.incRunningTasks()). For reasons described there, we must
+				// process at least one CPU clock tick between calls to
+				// k.runningTasksCond.Wait().
+			}
+			k.runningTasksMu.Unlock()
+		}
 
-func newKernelCPUClockTicker(k *Kernel) *kernelCPUClockTicker {
-	return &kernelCPUClockTicker{
-		k:   k,
-		rng: rand.New(rand.NewSource(rand.Int63())),
-	}
-}
-
-// NotifyTimer implements ktime.TimerListener.NotifyTimer.
-func (ticker *kernelCPUClockTicker) NotifyTimer(exp uint64, setting ktime.Setting) (ktime.Setting, bool) {
-	// Only increment cpuClock by 1 regardless of the number of expirations.
-	// This approximately compensates for cases where thread throttling or bad
-	// Go runtime scheduling prevents the kernelCPUClockTicker goroutine, and
-	// presumably task goroutines as well, from executing for a long period of
-	// time. It's also necessary to prevent CPU clocks from seeing large
-	// discontinuous jumps.
-	now := ticker.k.cpuClock.Add(1)
-
-	// Check thread group CPU timers.
-	tgs := ticker.k.tasks.Root.ThreadGroupsAppend(ticker.tgs)
-	for _, tg := range tgs {
-		if atomic.LoadUint32(&tg.cpuTimersEnabled) == 0 {
+		// Wait for the next CPU clock tick.
+		select {
+		case <-k.cpuClockTickTimer.C:
+			k.cpuClockTickTimer.Reset(linux.ClockTick)
+		case <-k.cpuClockTickerWakeCh:
 			continue
 		}
 
-		ticker.k.tasks.mu.RLock()
-		if tg.leader == nil {
-			// No tasks have ever run in this thread group.
-			ticker.k.tasks.mu.RUnlock()
-			continue
-		}
-		// Accumulate thread group CPU stats, and randomly select running tasks
-		// using reservoir sampling to receive CPU timer signals.
-		var virtReceiver *Task
-		nrVirtCandidates := 0
-		var profReceiver *Task
-		nrProfCandidates := 0
-		tgUserTime := tg.exitedCPUStats.UserTime
-		tgSysTime := tg.exitedCPUStats.SysTime
-		for t := tg.tasks.Front(); t != nil; t = t.Next() {
-			tsched := t.TaskGoroutineSchedInfo()
-			tgUserTime += time.Duration(tsched.userTicksAt(now) * uint64(linux.ClockTick))
-			tgSysTime += time.Duration(tsched.sysTicksAt(now) * uint64(linux.ClockTick))
-			switch tsched.State {
-			case TaskGoroutineRunningApp:
-				// Considered by ITIMER_VIRT, ITIMER_PROF, and RLIMIT_CPU
-				// timers.
-				nrVirtCandidates++
-				if int(randInt31n(ticker.rng, int32(nrVirtCandidates))) == 0 {
-					virtReceiver = t
+		// Advance the CPU clock, and timers based on the CPU clock, atomically
+		// under cpuClockMu.
+		k.cpuClockMu.Lock()
+		now := k.cpuClock.Add(1)
+
+		// Check thread group CPU timers.
+		tgs = k.tasks.Root.ThreadGroupsAppend(tgs)
+		for _, tg := range tgs {
+			if tg.cpuTimersEnabled.Load() == 0 {
+				continue
+			}
+
+			k.tasks.mu.RLock()
+			if tg.leader == nil {
+				// No tasks have ever run in this thread group.
+				k.tasks.mu.RUnlock()
+				continue
+			}
+			// Accumulate thread group CPU stats, and randomly select running tasks
+			// using reservoir sampling to receive CPU timer signals.
+			var virtReceiver *Task
+			nrVirtCandidates := 0
+			var profReceiver *Task
+			nrProfCandidates := 0
+			tgUserTime := tg.exitedCPUStats.UserTime
+			tgSysTime := tg.exitedCPUStats.SysTime
+			for t := tg.tasks.Front(); t != nil; t = t.Next() {
+				tsched := t.TaskGoroutineSchedInfo()
+				tgUserTime += time.Duration(tsched.userTicksAt(now) * uint64(linux.ClockTick))
+				tgSysTime += time.Duration(tsched.sysTicksAt(now) * uint64(linux.ClockTick))
+				switch tsched.State {
+				case TaskGoroutineRunningApp:
+					// Considered by ITIMER_VIRT, ITIMER_PROF, and RLIMIT_CPU
+					// timers.
+					nrVirtCandidates++
+					if int(randInt31n(rng, int32(nrVirtCandidates))) == 0 {
+						virtReceiver = t
+					}
+					fallthrough
+				case TaskGoroutineRunningSys:
+					// Considered by ITIMER_PROF and RLIMIT_CPU timers.
+					nrProfCandidates++
+					if int(randInt31n(rng, int32(nrProfCandidates))) == 0 {
+						profReceiver = t
+					}
 				}
-				fallthrough
-			case TaskGoroutineRunningSys:
-				// Considered by ITIMER_PROF and RLIMIT_CPU timers.
-				nrProfCandidates++
-				if int(randInt31n(ticker.rng, int32(nrProfCandidates))) == 0 {
-					profReceiver = t
+			}
+			tgVirtNow := ktime.FromNanoseconds(tgUserTime.Nanoseconds())
+			tgProfNow := ktime.FromNanoseconds((tgUserTime + tgSysTime).Nanoseconds())
+
+			// All of the following are standard (not real-time) signals, which are
+			// automatically deduplicated, so we ignore the number of expirations.
+			tg.signalHandlers.mu.Lock()
+			// It should only be possible for these timers to advance if we found
+			// at least one running task.
+			if virtReceiver != nil {
+				// ITIMER_VIRTUAL
+				newItimerVirtSetting, exp := tg.itimerVirtSetting.At(tgVirtNow)
+				tg.itimerVirtSetting = newItimerVirtSetting
+				if exp != 0 {
+					virtReceiver.sendSignalLocked(SignalInfoPriv(linux.SIGVTALRM), true)
 				}
 			}
-		}
-		tgVirtNow := ktime.FromNanoseconds(tgUserTime.Nanoseconds())
-		tgProfNow := ktime.FromNanoseconds((tgUserTime + tgSysTime).Nanoseconds())
+			if profReceiver != nil {
+				// ITIMER_PROF
+				newItimerProfSetting, exp := tg.itimerProfSetting.At(tgProfNow)
+				tg.itimerProfSetting = newItimerProfSetting
+				if exp != 0 {
+					profReceiver.sendSignalLocked(SignalInfoPriv(linux.SIGPROF), true)
+				}
+				// RLIMIT_CPU soft limit
+				newRlimitCPUSoftSetting, exp := tg.rlimitCPUSoftSetting.At(tgProfNow)
+				tg.rlimitCPUSoftSetting = newRlimitCPUSoftSetting
+				if exp != 0 {
+					profReceiver.sendSignalLocked(SignalInfoPriv(linux.SIGXCPU), true)
+				}
+				// RLIMIT_CPU hard limit
+				rlimitCPUMax := tg.limits.Get(limits.CPU).Max
+				if rlimitCPUMax != limits.Infinity && !tgProfNow.Before(ktime.FromSeconds(int64(rlimitCPUMax))) {
+					profReceiver.sendSignalLocked(SignalInfoPriv(linux.SIGKILL), true)
+				}
+			}
+			tg.signalHandlers.mu.Unlock()
 
-		// All of the following are standard (not real-time) signals, which are
-		// automatically deduplicated, so we ignore the number of expirations.
-		tg.signalHandlers.mu.Lock()
-		// It should only be possible for these timers to advance if we found
-		// at least one running task.
-		if virtReceiver != nil {
-			// ITIMER_VIRTUAL
-			newItimerVirtSetting, exp := tg.itimerVirtSetting.At(tgVirtNow)
-			tg.itimerVirtSetting = newItimerVirtSetting
-			if exp != 0 {
-				virtReceiver.sendSignalLocked(SignalInfoPriv(linux.SIGVTALRM), true)
-			}
+			k.tasks.mu.RUnlock()
 		}
-		if profReceiver != nil {
-			// ITIMER_PROF
-			newItimerProfSetting, exp := tg.itimerProfSetting.At(tgProfNow)
-			tg.itimerProfSetting = newItimerProfSetting
-			if exp != 0 {
-				profReceiver.sendSignalLocked(SignalInfoPriv(linux.SIGPROF), true)
-			}
-			// RLIMIT_CPU soft limit
-			newRlimitCPUSoftSetting, exp := tg.rlimitCPUSoftSetting.At(tgProfNow)
-			tg.rlimitCPUSoftSetting = newRlimitCPUSoftSetting
-			if exp != 0 {
-				profReceiver.sendSignalLocked(SignalInfoPriv(linux.SIGXCPU), true)
-			}
-			// RLIMIT_CPU hard limit
-			rlimitCPUMax := tg.limits.Get(limits.CPU).Max
-			if rlimitCPUMax != limits.Infinity && !tgProfNow.Before(ktime.FromSeconds(int64(rlimitCPUMax))) {
-				profReceiver.sendSignalLocked(SignalInfoPriv(linux.SIGKILL), true)
-			}
-		}
-		tg.signalHandlers.mu.Unlock()
 
-		ticker.k.tasks.mu.RUnlock()
+		k.cpuClockMu.Unlock()
+
+		// Retain tgs between calls to Notify to reduce allocations.
+		for i := range tgs {
+			tgs[i] = nil
+		}
+		tgs = tgs[:0]
 	}
-
-	// Retain tgs between calls to Notify to reduce allocations.
-	for i := range tgs {
-		tgs[i] = nil
-	}
-	ticker.tgs = tgs[:0]
-
-	// If nothing is running, we can disable the timer.
-	tasks := ticker.k.runningTasks.Load()
-	if tasks == 0 {
-		ticker.k.runningTasksMu.Lock()
-		defer ticker.k.runningTasksMu.Unlock()
-		tasks := ticker.k.runningTasks.Load()
-		if tasks != 0 {
-			// Raced with a 0 -> 1 transition.
-			return setting, false
-		}
-
-		// Stop the timer. We must cache the current setting so the
-		// kernel can access it without violating the lock order.
-		ticker.k.cpuClockTickerSetting = setting
-		ticker.k.cpuClockTickerDisabled = true
-		setting.Enabled = false
-		return setting, true
-	}
-
-	return setting, false
 }
 
 // randInt31n returns a random integer in [0, n).
@@ -495,36 +483,36 @@ func randInt31n(rng *rand.Rand, n int32) int32 {
 //
 // Preconditions: The caller must be running on the task goroutine.
 func (t *Task) NotifyRlimitCPUUpdated() {
-	t.k.cpuClockTicker.Atomically(func() {
-		t.tg.pidns.owner.mu.RLock()
-		defer t.tg.pidns.owner.mu.RUnlock()
-		t.tg.signalHandlers.mu.Lock()
-		defer t.tg.signalHandlers.mu.Unlock()
-		rlimitCPU := t.tg.limits.Get(limits.CPU)
-		t.tg.rlimitCPUSoftSetting = ktime.Setting{
-			Enabled: rlimitCPU.Cur != limits.Infinity,
-			Next:    ktime.FromNanoseconds((time.Duration(rlimitCPU.Cur) * time.Second).Nanoseconds()),
-			Period:  time.Second,
+	t.k.cpuClockMu.Lock()
+	defer t.k.cpuClockMu.Unlock()
+	t.tg.pidns.owner.mu.RLock()
+	defer t.tg.pidns.owner.mu.RUnlock()
+	t.tg.signalHandlers.mu.Lock()
+	defer t.tg.signalHandlers.mu.Unlock()
+	rlimitCPU := t.tg.limits.Get(limits.CPU)
+	t.tg.rlimitCPUSoftSetting = ktime.Setting{
+		Enabled: rlimitCPU.Cur != limits.Infinity,
+		Next:    ktime.FromNanoseconds((time.Duration(rlimitCPU.Cur) * time.Second).Nanoseconds()),
+		Period:  time.Second,
+	}
+	if rlimitCPU.Max != limits.Infinity {
+		// Check if tg is already over the hard limit.
+		tgcpu := t.tg.cpuStatsAtLocked(t.k.CPUClockNow())
+		tgProfNow := ktime.FromNanoseconds((tgcpu.UserTime + tgcpu.SysTime).Nanoseconds())
+		if !tgProfNow.Before(ktime.FromSeconds(int64(rlimitCPU.Max))) {
+			t.sendSignalLocked(SignalInfoPriv(linux.SIGKILL), true)
 		}
-		if rlimitCPU.Max != limits.Infinity {
-			// Check if tg is already over the hard limit.
-			tgcpu := t.tg.cpuStatsAtLocked(t.k.CPUClockNow())
-			tgProfNow := ktime.FromNanoseconds((tgcpu.UserTime + tgcpu.SysTime).Nanoseconds())
-			if !tgProfNow.Before(ktime.FromSeconds(int64(rlimitCPU.Max))) {
-				t.sendSignalLocked(SignalInfoPriv(linux.SIGKILL), true)
-			}
-		}
-		t.tg.updateCPUTimersEnabledLocked()
-	})
+	}
+	t.tg.updateCPUTimersEnabledLocked()
 }
 
 // Preconditions: The signal mutex must be locked.
 func (tg *ThreadGroup) updateCPUTimersEnabledLocked() {
 	rlimitCPU := tg.limits.Get(limits.CPU)
 	if tg.itimerVirtSetting.Enabled || tg.itimerProfSetting.Enabled || tg.rlimitCPUSoftSetting.Enabled || rlimitCPU.Max != limits.Infinity {
-		atomic.StoreUint32(&tg.cpuTimersEnabled, 1)
+		tg.cpuTimersEnabled.Store(1)
 	} else {
-		atomic.StoreUint32(&tg.cpuTimersEnabled, 0)
+		tg.cpuTimersEnabled.Store(0)
 	}
 }
 
@@ -612,7 +600,7 @@ func (t *Task) SetCPUMask(mask sched.CPUSet) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.allowedCPUMask = mask
-	atomic.StoreInt32(&t.cpu, assignCPU(mask, rootTID))
+	t.cpu.Store(assignCPU(mask, rootTID))
 	return nil
 }
 
@@ -622,7 +610,7 @@ func (t *Task) CPU() int32 {
 		return int32(hostcpu.GetCPU())
 	}
 
-	return atomic.LoadInt32(&t.cpu)
+	return t.cpu.Load()
 }
 
 // assignCPU returns the virtualized CPU number for the task with global TID

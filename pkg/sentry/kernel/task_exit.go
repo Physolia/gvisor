@@ -16,13 +16,13 @@ package kernel
 
 // This file implements the task exit cycle:
 //
-// - Tasks are asynchronously requested to exit with Task.Kill.
+//	- Tasks are asynchronously requested to exit with Task.Kill.
 //
-// - When able, the task goroutine enters the exit path starting from state
-// runExit.
+//	- When able, the task goroutine enters the exit path starting from state
+//		runExit.
 //
-// - Other tasks observe completed exits with Task.Wait (which implements the
-// wait*() family of syscalls).
+//	- Other tasks observe completed exits with Task.Wait (which implements the
+//		wait*() family of syscalls).
 
 import (
 	"errors"
@@ -31,6 +31,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
@@ -116,8 +117,17 @@ func (t *Task) killedLocked() bool {
 //
 // Preconditions: The caller must be running on the task goroutine.
 func (t *Task) PrepareExit(ws linux.WaitStatus) {
+	t.tg.pidns.owner.mu.RLock()
+	defer t.tg.pidns.owner.mu.RUnlock()
 	t.tg.signalHandlers.mu.Lock()
 	defer t.tg.signalHandlers.mu.Unlock()
+
+	last := t.tg.activeTasks == 1
+	if last {
+		t.prepareGroupExitLocked(ws)
+		return
+	}
+
 	t.exitStatus = ws
 }
 
@@ -132,6 +142,13 @@ func (t *Task) PrepareExit(ws linux.WaitStatus) {
 func (t *Task) PrepareGroupExit(ws linux.WaitStatus) {
 	t.tg.signalHandlers.mu.Lock()
 	defer t.tg.signalHandlers.mu.Unlock()
+	t.prepareGroupExitLocked(ws)
+}
+
+// Preconditions:
+//   - The caller must be running on the task goroutine.
+//   - The signal mutex must be locked.
+func (t *Task) prepareGroupExitLocked(ws linux.WaitStatus) {
 	if t.tg.exiting || t.tg.execing != nil {
 		// Note that if t.tg.exiting is false but t.tg.execing is not nil, i.e.
 		// this "group exit" is being executed by the killed sibling of an
@@ -203,6 +220,21 @@ type runExitMain struct{}
 
 func (*runExitMain) execute(t *Task) taskRunState {
 	t.traceExitEvent()
+
+	if seccheck.Global.Enabled(seccheck.PointTaskExit) {
+		info := &pb.TaskExit{
+			ExitStatus: int32(t.tg.exitStatus),
+		}
+		fields := seccheck.Global.GetFieldSet(seccheck.PointTaskExit)
+		if !fields.Context.Empty() {
+			info.ContextData = &pb.ContextData{}
+			LoadSeccheckData(t, fields.Context, info.ContextData)
+		}
+		seccheck.Global.SentToSinks(func(c seccheck.Sink) error {
+			return c.TaskExit(t, fields, info)
+		})
+	}
+
 	lastExiter := t.exitThreadGroup()
 
 	t.ResetKcov()
@@ -253,14 +285,19 @@ func (*runExitMain) execute(t *Task) taskRunState {
 	t.LeaveCgroups()
 
 	t.mu.Lock()
-	mntns := t.mountNamespaceVFS2
-	t.mountNamespaceVFS2 = nil
+	mntns := t.mountNamespace
+	t.mountNamespace = nil
+	utsns := t.utsns
+	t.utsns = nil
 	ipcns := t.ipcns
+	t.ipcns = nil
+	netns := t.netns
+	t.netns = nil
 	t.mu.Unlock()
-	if mntns != nil {
-		mntns.DecRef(t)
-	}
+	mntns.DecRef(t)
+	utsns.DecRef(t)
 	ipcns.DecRef(t)
+	netns.DecRef(t)
 
 	// If this is the last task to exit from the thread group, release the
 	// thread group's resources.
@@ -363,6 +400,8 @@ func (t *Task) exitChildren() {
 // findReparentTargetLocked returns the task to which t's children should be
 // reparented. If no such task exists, findNewParentLocked returns nil.
 //
+// This corresponds to Linux's find_new_reaper().
+//
 // Preconditions: The TaskSet mutex must be locked.
 func (t *Task) findReparentTargetLocked() *Task {
 	// Reparent to any sibling in the same thread group that hasn't begun
@@ -370,12 +409,35 @@ func (t *Task) findReparentTargetLocked() *Task {
 	if t2 := t.tg.anyNonExitingTaskLocked(); t2 != nil {
 		return t2
 	}
-	// "A child process that is orphaned within the namespace will be
-	// reparented to [the init process for the namespace] ..." -
-	// pid_namespaces(7)
-	if init := t.tg.pidns.tasks[InitTID]; init != nil {
-		return init.tg.anyNonExitingTaskLocked()
+
+	if !t.tg.hasChildSubreaper {
+		// No child subreaper exists. We can immediately return the
+		// init process in this PID namespace if it exists.
+		if init := t.tg.pidns.tasks[initTID]; init != nil {
+			return init.tg.anyNonExitingTaskLocked()
+		}
+		return nil
 	}
+
+	// Walk up the process tree until we either find a subreaper, or we hit
+	// the init process in the PID namespace.
+	for parent := t.parent; parent != nil; parent = parent.parent {
+		if parent.tg.isInitInLocked(parent.PIDNamespace()) {
+			// We found the init process for this pid namespace,
+			// return a task from it. If the init process is
+			// exiting, this might return nil.
+			return parent.tg.anyNonExitingTaskLocked()
+		}
+		if parent.tg.isChildSubreaper {
+			// We found a subreaper process. Return a non-exiting
+			// task if there is one, otherwise keep walking up the
+			// process tree.
+			if target := parent.tg.anyNonExitingTaskLocked(); target != nil {
+				return target
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -438,24 +500,24 @@ func (t *Task) reparentLocked(parent *Task) {
 //
 // There are a few ways for an exit notification to be resolved:
 //
-// - The exit notification may be acknowledged by a call to Task.Wait with
-// WaitOptions.ConsumeEvent set (e.g. due to a wait4() syscall).
+//	- The exit notification may be acknowledged by a call to Task.Wait with
+//   WaitOptions.ConsumeEvent set (e.g. due to a wait4() syscall).
 //
-// - If the notified party is the parent, and the parent thread group is not
-// also the tracer thread group, and the notification signal is SIGCHLD, the
-// parent may explicitly ignore the notification (see quote in exitNotify).
-// Note that it's possible for the notified party to ignore the signal in other
-// cases, but the notification is only resolved under the above conditions.
-// (Actually, there is one exception; see the last paragraph of the "leader,
-// has tracer, tracer thread group is parent thread group" case below.)
+//	- If the notified party is the parent, and the parent thread group is not
+//		also the tracer thread group, and the notification signal is SIGCHLD, the
+//		parent may explicitly ignore the notification (see quote in exitNotify).
+//		Note that it's possible for the notified party to ignore the signal in other
+//		cases, but the notification is only resolved under the above conditions.
+//		(Actually, there is one exception; see the last paragraph of the "leader,
+//		has tracer, tracer thread group is parent thread group" case below.)
 //
-// - If the notified party is the parent, and the parent does not exist, the
-// notification is resolved as if ignored. (This is only possible in the
-// sentry. In Linux, the only task / thread group without a parent is global
-// init, and killing global init causes a kernel panic.)
+//	- If the notified party is the parent, and the parent does not exist, the
+//		notification is resolved as if ignored. (This is only possible in the
+//		sentry. In Linux, the only task / thread group without a parent is global
+//		init, and killing global init causes a kernel panic.)
 //
-// - If the notified party is a tracer, the tracer may detach the traced task.
-// (Zombie tasks cannot be ptrace-attached, so the reverse is not possible.)
+//	- If the notified party is a tracer, the tracer may detach the traced task.
+//		(Zombie tasks cannot be ptrace-attached, so the reverse is not possible.)
 //
 // In addition, if the notified party is the parent, the parent may exit and
 // cause the notifying task to be reparented to another thread group. This does
@@ -466,23 +528,23 @@ func (t *Task) reparentLocked(parent *Task) {
 // whether it is a thread group leader; whether the task is ptraced; and, if
 // so, whether the tracer thread group is the same as the parent thread group.
 //
-// - Non-leader, no tracer: No notification is generated; the task is reaped
-// immediately.
+//	- Non-leader, no tracer: No notification is generated; the task is reaped
+//		immediately.
 //
-// - Non-leader, has tracer: SIGCHLD is sent to the tracer. When the tracer
-// notification is resolved (by waiting or detaching), the task is reaped. (For
-// non-leaders, whether the tracer and parent thread groups are the same is
-// irrelevant.)
+//	- Non-leader, has tracer: SIGCHLD is sent to the tracer. When the tracer
+//		notification is resolved (by waiting or detaching), the task is reaped. (For
+//		non-leaders, whether the tracer and parent thread groups are the same is
+//		irrelevant.)
 //
-// - Leader, no tracer: The task remains a zombie, with no notification sent,
-// until all other tasks in the thread group are dead. (In Linux terms, this
-// condition is indicated by include/linux/sched.h:thread_group_empty(); tasks
-// are removed from their thread_group list in kernel/exit.c:release_task() =>
-// __exit_signal() => __unhash_process().) Then the thread group's termination
-// signal is sent to the parent. When the parent notification is resolved (by
-// waiting or ignoring), the task is reaped.
+//	- Leader, no tracer: The task remains a zombie, with no notification sent,
+//		until all other tasks in the thread group are dead. (In Linux terms, this
+//		condition is indicated by include/linux/sched.h:thread_group_empty(); tasks
+//		are removed from their thread_group list in kernel/exit.c:release_task() =>
+// 		__exit_signal() => __unhash_process().) Then the thread group's termination
+//		signal is sent to the parent. When the parent notification is resolved (by
+//		waiting or ignoring), the task is reaped.
 //
-// - Leader, has tracer, tracer thread group is not parent thread group:
+//	- Leader, has tracer, tracer thread group is not parent thread group:
 // SIGCHLD is sent to the tracer. When the tracer notification is resolved (by
 // waiting or detaching), and all other tasks in the thread group are dead, the
 // thread group's termination signal is sent to the parent. (Note that the
@@ -490,7 +552,7 @@ func (t *Task) reparentLocked(parent *Task) {
 // group is empty.) When the parent notification is resolved, the task is
 // reaped.
 //
-// - Leader, has tracer, tracer thread group is parent thread group:
+//	- Leader, has tracer, tracer thread group is parent thread group:
 //
 // If all other tasks in the thread group are dead, the thread group's
 // termination signal is sent to the parent. At this point, the notification
@@ -618,11 +680,11 @@ func (t *Task) exitNotifyLocked(fromPtraceDetach bool) {
 				//
 				// Some undocumented Linux-specific details:
 				//
-				// - All of the above is ignored if the termination signal isn't
-				// SIGCHLD.
+				//	- All of the above is ignored if the termination signal isn't
+				//		SIGCHLD.
 				//
-				// - SA_NOCLDWAIT causes the leader to be immediately reaped, but
-				// does not suppress the SIGCHLD.
+				//	- SA_NOCLDWAIT causes the leader to be immediately reaped, but
+				//		does not suppress the SIGCHLD.
 				signalParent := t.tg.terminationSignal.IsValid()
 				t.parent.tg.signalHandlers.mu.Lock()
 				if t.tg.terminationSignal == linux.SIGCHLD || fromPtraceDetach {
@@ -645,9 +707,16 @@ func (t *Task) exitNotifyLocked(fromPtraceDetach bool) {
 				// should return ECHILD).
 				t.parent.tg.eventQueue.Notify(EventExit | EventChildGroupStop | EventGroupContinue)
 			}
-			if seccheck.Global.Enabled(seccheck.PointExitNotifyParent) {
+
+			// We don't send exit events for the root process because we don't send
+			// Clone or Exec events for the initial process.
+			if t.tg != t.k.globalInit && seccheck.Global.Enabled(seccheck.PointExitNotifyParent) {
 				mask, info := getExitNotifyParentSeccheckInfo(t)
-				seccheck.Global.ExitNotifyParent(t, mask, info)
+				if err := seccheck.Global.SentToSinks(func(c seccheck.Sink) error {
+					return c.ExitNotifyParent(t, mask, info)
+				}); err != nil {
+					log.Infof("Ignoring error from ExitNotifyParent point: %v", err)
+				}
 			}
 		}
 	}
@@ -669,6 +738,7 @@ func (t *Task) exitNotifyLocked(fromPtraceDetach bool) {
 			// is via a call to release_task()).
 			t.tg.leader.exitNotifyLocked(false)
 		} else if tc == 0 {
+			t.tg.pidWithinNS.Store(0)
 			t.tg.processGroup.decRefWithParent(t.tg.parentPG())
 		}
 		if t.parent != nil {
@@ -706,7 +776,9 @@ func getExitNotifyParentSeccheckInfo(t *Task) (seccheck.FieldSet, *pb.ExitNotify
 	}
 	if !fields.Context.Empty() {
 		info.ContextData = &pb.ContextData{}
-		LoadSeccheckDataLocked(t, fields.Context, info.ContextData)
+		// cwd isn't used for notifyExit seccheck so it's ok to pass an empty
+		// string.
+		LoadSeccheckDataLocked(t, fields.Context, info.ContextData, "")
 	}
 
 	return fields, info

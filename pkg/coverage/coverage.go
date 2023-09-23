@@ -23,6 +23,9 @@
 // coverage surface. This causes bazel to use the Go cover tool manually to
 // generate instrumented files. It injects a hook that registers all coverage
 // data with the coverdata package.
+//
+// Using coverdata.Counters requires sync/atomic integers.
+// +checkalignedignore
 package coverage
 
 import (
@@ -110,7 +113,7 @@ func ClearCoverageData() {
 }
 
 var coveragePool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return make([]byte, 0)
 	},
 }
@@ -180,11 +183,6 @@ func ConsumeCoverageData(w io.Writer) int {
 		}
 	}
 
-	if total == 0 {
-		// An empty profile indicates that coverage is not enabled, in which case
-		// there shouldn't be any task work registered.
-		panic("kcov task work is registered, but no coverage data was found")
-	}
 	return total
 }
 

@@ -17,11 +17,11 @@ package tun
 import (
 	"fmt"
 
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	"gvisor.dev/gvisor/pkg/tcpip/link/packetsocket"
@@ -181,7 +181,7 @@ func (d *Device) MTU() (uint32, error) {
 }
 
 // Write inject one inbound packet to the network interface.
-func (d *Device) Write(data []byte) (int64, error) {
+func (d *Device) Write(data *buffer.View) (int64, error) {
 	d.mu.RLock()
 	endpoint := d.endpoint
 	d.mu.RUnlock()
@@ -192,28 +192,34 @@ func (d *Device) Write(data []byte) (int64, error) {
 		return 0, linuxerr.EIO
 	}
 
-	dataLen := int64(len(data))
+	dataLen := int64(data.Size())
 
 	// Packet information.
 	var pktInfoHdr PacketInfoHeader
 	if !d.flags.NoPacketInfo {
-		if len(data) < PacketInfoHeaderSize {
+		if dataLen < PacketInfoHeaderSize {
 			// Ignore bad packet.
 			return dataLen, nil
 		}
-		pktInfoHdr = PacketInfoHeader(data[:PacketInfoHeaderSize])
-		data = data[PacketInfoHeaderSize:]
+		pktInfoHdrView := data.Clone()
+		defer pktInfoHdrView.Release()
+		pktInfoHdrView.CapLength(PacketInfoHeaderSize)
+		pktInfoHdr = PacketInfoHeader(pktInfoHdrView.AsSlice())
+		data.TrimFront(PacketInfoHeaderSize)
 	}
 
 	// Ethernet header (TAP only).
 	var ethHdr header.Ethernet
 	if d.flags.TAP {
-		if len(data) < header.EthernetMinimumSize {
+		if data.Size() < header.EthernetMinimumSize {
 			// Ignore bad packet.
 			return dataLen, nil
 		}
-		ethHdr = header.Ethernet(data[:header.EthernetMinimumSize])
-		data = data[header.EthernetMinimumSize:]
+		ethHdrView := data.Clone()
+		defer ethHdrView.Release()
+		ethHdrView.CapLength(header.EthernetMinimumSize)
+		ethHdr = header.Ethernet(ethHdrView.AsSlice())
+		data.TrimFront(header.EthernetMinimumSize)
 	}
 
 	// Try to determine network protocol number, default zero.
@@ -226,7 +232,7 @@ func (d *Device) Write(data []byte) (int64, error) {
 	case d.flags.TUN:
 		// TUN interface with IFF_NO_PI enabled, thus
 		// we need to determine protocol from version field
-		version := data[0] >> 4
+		version := data.AsSlice()[0] >> 4
 		if version == 4 {
 			protocol = header.IPv4ProtocolNumber
 		} else if version == 6 {
@@ -236,7 +242,7 @@ func (d *Device) Write(data []byte) (int64, error) {
 
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 		ReserveHeaderBytes: len(ethHdr),
-		Data:               buffer.View(data).ToVectorisedView(),
+		Payload:            buffer.MakeWithView(data.Clone()),
 	})
 	defer pkt.DecRef()
 	copy(pkt.LinkHeader().Push(len(ethHdr)), ethHdr)
@@ -245,7 +251,7 @@ func (d *Device) Write(data []byte) (int64, error) {
 }
 
 // Read reads one outgoing packet from the network interface.
-func (d *Device) Read() ([]byte, error) {
+func (d *Device) Read() (*buffer.View, error) {
 	d.mu.RLock()
 	endpoint := d.endpoint
 	d.mu.RUnlock()
@@ -253,38 +259,35 @@ func (d *Device) Read() ([]byte, error) {
 		return nil, linuxerr.EBADFD
 	}
 
-	for {
-		pkt := endpoint.Read()
-		if pkt == nil {
-			return nil, linuxerr.ErrWouldBlock
-		}
-
-		v, ok := d.encodePkt(pkt)
-		pkt.DecRef()
-		if !ok {
-			// Ignore unsupported packet.
-			continue
-		}
-		return v, nil
+	pkt := endpoint.Read()
+	if pkt.IsNil() {
+		return nil, linuxerr.ErrWouldBlock
 	}
+	v := d.encodePkt(pkt)
+	pkt.DecRef()
+	return v, nil
 }
 
 // encodePkt encodes packet for fd side.
-func (d *Device) encodePkt(pkt *stack.PacketBuffer) (buffer.View, bool) {
-	var vv buffer.VectorisedView
+func (d *Device) encodePkt(pkt stack.PacketBufferPtr) *buffer.View {
+	var view *buffer.View
 
 	// Packet information.
 	if !d.flags.NoPacketInfo {
-		hdr := make(PacketInfoHeader, PacketInfoHeaderSize)
+		view = buffer.NewView(PacketInfoHeaderSize + pkt.Size())
+		view.Grow(PacketInfoHeaderSize)
+		hdr := PacketInfoHeader(view.AsSlice())
 		hdr.Encode(&PacketInfoFields{
 			Protocol: pkt.NetworkProtocolNumber,
 		})
-		vv.AppendView(buffer.View(hdr))
+		pktView := pkt.ToView()
+		view.Write(pktView.AsSlice())
+		pktView.Release()
+	} else {
+		view = pkt.ToView()
 	}
 
-	vv.AppendViews(pkt.Views())
-
-	return vv.ToView(), true
+	return view
 }
 
 // Name returns the name of the attached network interface. Empty string if
@@ -354,7 +357,7 @@ func (e *tunEndpoint) ARPHardwareType() header.ARPHardwareType {
 }
 
 // AddHeader implements stack.LinkEndpoint.AddHeader.
-func (e *tunEndpoint) AddHeader(pkt *stack.PacketBuffer) {
+func (e *tunEndpoint) AddHeader(pkt stack.PacketBufferPtr) {
 	if !e.isTap {
 		return
 	}

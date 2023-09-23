@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build linux
-// +build linux
+//go:build linux && !debug
+// +build linux,!debug
 
 // Package platforms imports all available platform packages.
 package platforms
@@ -22,4 +22,5 @@ import (
 	// Import platforms that runsc might use.
 	_ "gvisor.dev/gvisor/pkg/sentry/platform/kvm"
 	_ "gvisor.dev/gvisor/pkg/sentry/platform/ptrace"
+	_ "gvisor.dev/gvisor/pkg/sentry/platform/systrap"
 )

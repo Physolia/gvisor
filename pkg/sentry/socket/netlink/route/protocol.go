@@ -18,9 +18,9 @@ package route
 import (
 	"bytes"
 
-	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -335,7 +335,7 @@ func fillRoute(routes []inet.Route, addr []byte) (inet.Route, *syserr.Error) {
 		idx = idxDef
 	}
 	if idx == -1 {
-		return inet.Route{}, syserr.ErrNoRoute
+		return inet.Route{}, syserr.ErrHostUnreachable
 	}
 
 	route := routes[idx]
@@ -479,7 +479,7 @@ func (p *Protocol) newAddr(ctx context.Context, msg *netlink.Message, ms *netlin
 				Flags:     ifa.Flags,
 				Addr:      value,
 			})
-			if err == unix.EEXIST {
+			if linuxerr.Equals(linuxerr.EEXIST, err) {
 				flags := msg.Header().Flags
 				if flags&linux.NLM_F_EXCL != 0 {
 					return syserr.ErrExists

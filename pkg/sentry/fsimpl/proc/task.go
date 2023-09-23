@@ -35,8 +35,10 @@ type taskInode struct {
 	implStatFS
 	kernfs.InodeAttrs
 	kernfs.InodeDirectoryNoNewChildren
+	kernfs.InodeNotAnonymous
 	kernfs.InodeNotSymlink
 	kernfs.InodeTemporary
+	kernfs.InodeWatches
 	kernfs.OrderedChildren
 	taskInodeRefs
 
@@ -54,27 +56,32 @@ func (fs *filesystem) newTaskInode(ctx context.Context, task *kernel.Task, pidns
 
 	contents := map[string]kernfs.Inode{
 		"auxv":      fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &auxvData{task: task}),
-		"cmdline":   fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &cmdlineData{task: task, arg: cmdlineDataArg}),
-		"comm":      fs.newComm(ctx, task, fs.NextIno(), 0444),
+		"cmdline":   fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &metadataData{task: task, metaType: Cmdline}),
+		"comm":      fs.newComm(ctx, task, fs.NextIno(), 0644),
 		"cwd":       fs.newCwdSymlink(ctx, task, fs.NextIno()),
-		"environ":   fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &cmdlineData{task: task, arg: environDataArg}),
+		"environ":   fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &metadataData{task: task, metaType: Environ}),
 		"exe":       fs.newExeSymlink(ctx, task, fs.NextIno()),
 		"fd":        fs.newFDDirInode(ctx, task),
 		"fdinfo":    fs.newFDInfoDirInode(ctx, task),
 		"gid_map":   fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0644, &idMapData{task: task, gids: true}),
 		"io":        fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0400, newIO(task, isThreadGroup)),
+		"limits":    fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &limitsData{task: task}),
 		"maps":      fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &mapsData{task: task}),
 		"mem":       fs.newMemInode(ctx, task, fs.NextIno(), 0400),
 		"mountinfo": fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &mountInfoData{fs: fs, task: task}),
 		"mounts":    fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &mountsData{fs: fs, task: task}),
 		"net":       fs.newTaskNetDir(ctx, task),
 		"ns": fs.newTaskOwnedDir(ctx, task, fs.NextIno(), 0511, map[string]kernfs.Inode{
-			"net":  fs.newNamespaceSymlink(ctx, task, fs.NextIno(), "net"),
-			"pid":  fs.newNamespaceSymlink(ctx, task, fs.NextIno(), "pid"),
-			"user": fs.newNamespaceSymlink(ctx, task, fs.NextIno(), "user"),
+			"net":  fs.newNamespaceSymlink(ctx, task, fs.NextIno(), linux.CLONE_NEWNET),
+			"mnt":  fs.newNamespaceSymlink(ctx, task, fs.NextIno(), linux.CLONE_NEWNS),
+			"pid":  fs.newPIDNamespaceSymlink(ctx, task, fs.NextIno()),
+			"user": fs.newFakeNamespaceSymlink(ctx, task, fs.NextIno(), "user"),
+			"ipc":  fs.newNamespaceSymlink(ctx, task, fs.NextIno(), linux.CLONE_NEWIPC),
+			"uts":  fs.newNamespaceSymlink(ctx, task, fs.NextIno(), linux.CLONE_NEWUTS),
 		}),
 		"oom_score":     fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, newStaticFile("0\n")),
 		"oom_score_adj": fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0644, &oomScoreAdj{task: task}),
+		"root":          fs.newRootSymlink(ctx, task, fs.NextIno()),
 		"smaps":         fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &smapsData{task: task}),
 		"stat":          fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &taskStatData{task: task, pidns: pidns, tgstats: isThreadGroup}),
 		"statm":         fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &statmData{task: task}),
@@ -83,6 +90,8 @@ func (fs *filesystem) newTaskInode(ctx context.Context, task *kernel.Task, pidns
 	}
 	if isThreadGroup {
 		contents["task"] = fs.newSubtasks(ctx, task, pidns, fakeCgroupControllers)
+	} else {
+		contents["children"] = fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0644, &childrenData{task: task, pidns: pidns})
 	}
 	if len(fakeCgroupControllers) > 0 {
 		contents["cgroup"] = fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, newFakeCgroupData(fakeCgroupControllers))

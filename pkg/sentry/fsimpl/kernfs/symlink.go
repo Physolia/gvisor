@@ -29,8 +29,10 @@ import (
 type StaticSymlink struct {
 	InodeAttrs
 	InodeNoopRefCount
+	InodeNotAnonymous
 	InodeSymlink
 	InodeNoStatFS
+	InodeWatches
 
 	target string
 }

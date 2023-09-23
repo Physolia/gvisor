@@ -19,24 +19,28 @@ package config
 
 import (
 	"fmt"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/refs"
-	controlpb "gvisor.dev/gvisor/pkg/sentry/control/control_go_proto"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
+	"gvisor.dev/gvisor/runsc/flag"
+	"gvisor.dev/gvisor/runsc/version"
 )
 
 // Config holds configuration that is not part of the runtime spec.
 //
 // Follow these steps to add a new flag:
-//   1. Create a new field in Config.
-//   2. Add a field tag with the flag name
-//   3. Register a new flag in flags.go, with same name and add a description
-//   4. Add any necessary validation into validate()
-//   5. If adding an enum, follow the same pattern as FileAccessType
-//   6. Evaluate if the flag can be changed with OCI annotations. See
-//      overrideAllowlist for more details
-//
+//  1. Create a new field in Config.
+//  2. Add a field tag with the flag name
+//  3. Register a new flag in flags.go, with same name and add a description
+//  4. Add any necessary validation into validate()
+//  5. If adding an enum, follow the same pattern as FileAccessType
+//  6. Evaluate if the flag can be changed with OCI annotations. See
+//     overrideAllowlist for more details
 type Config struct {
 	// RootDir is the runtime root directory.
 	RootDir string `flag:"root"`
@@ -56,6 +60,11 @@ type Config struct {
 	// DebugLog is the path to log debug information to, if not empty.
 	DebugLog string `flag:"debug-log"`
 
+	// DebugCommand is a comma-separated list of commands to be debugged if
+	// --debug-log is also set. Empty means debug all. "!" negates the expression.
+	// E.g. "create,start" or "!boot,events".
+	DebugCommand string `flag:"debug-command"`
+
 	// PanicLog is the path to log GO's runtime messages, if not empty.
 	PanicLog string `flag:"panic-log"`
 
@@ -71,15 +80,23 @@ type Config struct {
 	// FileAccessMounts indicates how non-root volumes are accessed.
 	FileAccessMounts FileAccessType `flag:"file-access-mounts"`
 
-	// Overlay is whether to wrap the root filesystem in an overlay.
+	// Overlay is whether to wrap all mounts in an overlay. The upper tmpfs layer
+	// will be backed by application memory.
 	Overlay bool `flag:"overlay"`
 
-	// Verity is whether there's one or more verity file system to mount.
-	Verity bool `flag:"verity"`
+	// Overlay2 holds configuration about wrapping mounts in overlayfs.
+	// DO NOT call it directly, use GetOverlay2() instead.
+	Overlay2 Overlay2 `flag:"overlay2"`
 
-	// FSGoferHostUDS enables the gofer to mount a host UDS and connect to it or
-	// bind (create) a host UDS and serve it.
+	// FSGoferHostUDS is deprecated: use host-uds=all.
 	FSGoferHostUDS bool `flag:"fsgofer-host-uds"`
+
+	// HostUDS controls permission to access host Unix-domain sockets.
+	// DO NOT call it directly, use GetHostUDS() instead.
+	HostUDS HostUDS `flag:"host-uds"`
+
+	// HostFifo controls permission to access host FIFO (or named pipes).
+	HostFifo HostFifo `flag:"host-fifo"`
 
 	// Network indicates what type of network to use.
 	Network NetworkType `flag:"network"`
@@ -92,11 +109,16 @@ type Config struct {
 	// AllowPacketEndpointWrite enables write operations on packet endpoints.
 	AllowPacketEndpointWrite bool `flag:"TESTONLY-allow-packet-endpoint-write"`
 
-	// HardwareGSO indicates that hardware segmentation offload is enabled.
-	HardwareGSO bool `flag:"gso"`
+	// HostGSO indicates that host segmentation offload is enabled.
+	HostGSO bool `flag:"gso"`
 
-	// SoftwareGSO indicates that software segmentation offload is enabled.
-	SoftwareGSO bool `flag:"software-gso"`
+	// GvisorGSO indicates that gVisor segmentation offload is enabled. The flag
+	// retains its old name of "software" GSO for API consistency.
+	GvisorGSO bool `flag:"software-gso"`
+
+	// GvisorGROTimeout sets gVisor's generic receive offload timeout. Zero
+	// bypasses GRO.
+	GvisorGROTimeout time.Duration `flag:"gvisor-gro"`
 
 	// TXChecksumOffload indicates that TX Checksum Offload is enabled.
 	TXChecksumOffload bool `flag:"tx-checksum-offload"`
@@ -111,6 +133,9 @@ type Config struct {
 	// LogPackets indicates that all network packets should be logged.
 	LogPackets bool `flag:"log-packets"`
 
+	// PCAP is a file to which network packets should be logged in PCAP format.
+	PCAP string `flag:"pcap-log"`
+
 	// Platform is the platform to run on.
 	Platform string `flag:"platform"`
 
@@ -118,6 +143,32 @@ type Config struct {
 	// e.g. "/dev/kvm" for the KVM platform.
 	// If unset, a sane platform-specific default will be used.
 	PlatformDevicePath string `flag:"platform_device_path"`
+
+	// MetricServer, if set, indicates that metrics should be exported on this address.
+	// This may either be 1) "addr:port" to export metrics on a specific network interface address,
+	// 2) ":port" for exporting metrics on all addresses, or 3) an absolute path to a Unix Domain
+	// Socket.
+	// The substring "%ID%" will be replaced by the container ID, and "%RUNTIME_ROOT%" by the root.
+	// This flag must be specified *both* as part of the `runsc metric-server` arguments (so that the
+	// metric server knows which address to bind to), and as part of the `runsc create` arguments (as
+	// an indication that the container being created wishes that its metrics should be exported).
+	// The value of this flag must also match across the two command lines.
+	MetricServer string `flag:"metric-server"`
+
+	// ProfilingMetrics is a comma separated list of metric names which are
+	// going to be written to the ProfilingMetricsLog file from within the
+	// sentry in CSV format. ProfilingMetrics will be snapshotted at a rate
+	// specified by ProfilingMetricsRate. Requires ProfilingMetricsLog to be
+	// set.
+	ProfilingMetrics string `flag:"profiling-metrics"`
+
+	// ProfilingMetricsLog is the file name to use for ProfilingMetrics
+	// output.
+	ProfilingMetricsLog string `flag:"profiling-metrics-log"`
+
+	// ProfilingMetricsRate is the target rate (in microseconds) at which
+	// profiling metrics will be snapshotted.
+	ProfilingMetricsRate int `flag:"profiling-metrics-rate-us"`
 
 	// Strace indicates that strace should be enabled.
 	Strace bool `flag:"strace"`
@@ -175,10 +226,7 @@ type Config struct {
 	// for the duration of the container execution.
 	TraceFile string `flag:"trace"`
 
-	// Controls defines the controls that may be enabled.
-	Controls controlConfig `flag:"controls"`
-
-	// RestoreFile is the path to the saved container image
+	// RestoreFile is the path to the saved container image.
 	RestoreFile string
 
 	// NumNetworkChannels controls the number of AF_PACKET sockets that map
@@ -205,15 +253,6 @@ type Config struct {
 	// E.g. 0.2 CPU quota will result in 1, and 1.9 in 2.
 	CPUNumFromQuota bool `flag:"cpu-num-from-quota"`
 
-	// Enables VFS2.
-	VFS2 bool `flag:"vfs2"`
-
-	// Enable lisafs.
-	Lisafs bool `flag:"lisafs"`
-
-	// Enables FUSE usage.
-	FUSE bool `flag:"fuse"`
-
 	// Allows overriding of flags in OCI annotations.
 	AllowFlagOverride bool `flag:"allow-flag-override"`
 
@@ -229,6 +268,46 @@ type Config struct {
 	// Use systemd to configure cgroups.
 	SystemdCgroup bool `flag:"systemd-cgroup"`
 
+	// PodInitConfig is the path to configuration file with additional steps to
+	// take during pod creation.
+	PodInitConfig string `flag:"pod-init-config"`
+
+	// Use pools to manage buffer memory instead of heap.
+	BufferPooling bool `flag:"buffer-pooling"`
+
+	// AFXDP defines whether to use an AF_XDP socket to receive packets
+	// (rather than AF_PACKET). Enabling it disables RX checksum offload.
+	AFXDP bool `flag:"EXPERIMENTAL-afxdp"`
+
+	// FDLimit specifies a limit on the number of host file descriptors that can
+	// be open simultaneously by the sentry and gofer. It applies separately to
+	// each.
+	FDLimit int `flag:"fdlimit"`
+
+	// DCache sets the global dirent cache size. If zero, per-mount caches are
+	// used.
+	DCache int `flag:"dcache"`
+
+	// IOUring enables support for the IO_URING API calls to perform
+	// asynchronous I/O operations.
+	IOUring bool `flag:"iouring"`
+
+	// DirectFS sets up the sandbox to directly access/mutate the filesystem from
+	// the sentry. Sentry runs with escalated privileges. Gofer process still
+	// exists, but is mostly idle. Not supported in rootless mode.
+	DirectFS bool `flag:"directfs"`
+
+	// NVProxy enables support for Nvidia GPUs.
+	NVProxy bool `flag:"nvproxy"`
+
+	// NVProxyDocker exposes GPUs to containers based on the
+	// NVIDIA_VISIBLE_DEVICES container environment variable, as requested by
+	// containers or set by `docker --gpus`.
+	NVProxyDocker bool `flag:"nvproxy-docker"`
+
+	// TPUProxy enables support for TPUs.
+	TPUProxy bool `flag:"tpuproxy"`
+
 	// TestOnlyAllowRunAsCurrentUserWithoutChroot should only be used in
 	// tests. It allows runsc to start the sandbox process as the current
 	// user, and without chrooting the sandbox process. This can be
@@ -242,11 +321,24 @@ type Config struct {
 	// multiple tests are run in parallel, since there is no way to pass
 	// parameters to the runtime from docker.
 	TestOnlyTestNameEnv string `flag:"TESTONLY-test-name-env"`
+
+	// TestOnlyAFSSyscallPanic should only be used in tests. It enables the
+	// alternate behaviour for afs_syscall to trigger a Go-runtime panic upon being
+	// called. This is useful for tests exercising gVisor panic-reporting.
+	TestOnlyAFSSyscallPanic bool `flag:"TESTONLY-afs-syscall-panic"`
+
+	// explicitlySet contains whether a flag was explicitly set on the command-line from which this
+	// Config was constructed. Nil when the Config was not initialized from a FlagSet.
+	explicitlySet map[string]struct{}
 }
 
 func (c *Config) validate() error {
-	if c.FileAccess == FileAccessShared && c.Overlay {
-		return fmt.Errorf("overlay flag is incompatible with shared file access")
+	if c.Overlay && c.Overlay2.Enabled() {
+		// Deprecated flag was used together with flag that replaced it.
+		return fmt.Errorf("overlay flag has been replaced with overlay2 flag")
+	}
+	if overlay2 := c.GetOverlay2(); c.FileAccess == FileAccessShared && overlay2.Enabled() {
+		return fmt.Errorf("overlay flag is incompatible with shared file access for rootfs")
 	}
 	if c.NumNetworkChannels <= 0 {
 		return fmt.Errorf("num_network_channels must be > 0, got: %d", c.NumNetworkChannels)
@@ -266,7 +358,102 @@ func (c *Config) validate() error {
 	if c.ProfileMutex != "" && !c.ProfileEnable {
 		return fmt.Errorf("profile-mutex flag requires enabling profiling with profile flag")
 	}
+	if c.FSGoferHostUDS && c.HostUDS != HostUDSNone {
+		// Deprecated flag was used together with flag that replaced it.
+		return fmt.Errorf("fsgofer-host-uds has been replaced with host-uds flag")
+	}
+	if len(c.ProfilingMetrics) > 0 && len(c.ProfilingMetricsLog) == 0 {
+		return fmt.Errorf("profiling-metrics flag requires defining a profiling-metrics-log for output")
+	}
 	return nil
+}
+
+// GetHostUDS returns the FS gofer communication that is allowed, taking into
+// consideration all flags what affect the result.
+func (c *Config) GetHostUDS() HostUDS {
+	if c.FSGoferHostUDS {
+		if c.HostUDS != HostUDSNone {
+			panic(fmt.Sprintf("HostUDS cannot be set when --fsgofer-host-uds=true"))
+		}
+		// Using deprecated flag, honor it to avoid breaking users.
+		return HostUDSOpen
+	}
+	return c.HostUDS
+}
+
+// GetOverlay2 returns the overlay configuration, taking into consideration all
+// flags that affect the result.
+func (c *Config) GetOverlay2() Overlay2 {
+	if c.Overlay {
+		if c.Overlay2.Enabled() {
+			panic(fmt.Sprintf("Overlay2 cannot be set when --overlay=true"))
+		}
+		// Using a deprecated flag, honor it to avoid breaking users.
+		return Overlay2{rootMount: true, subMounts: true, medium: "memory"}
+	}
+	return c.Overlay2
+}
+
+// Bundle is a set of flag name-value pairs.
+type Bundle map[string]string
+
+// BundleName is a human-friendly name for a Bundle.
+// It is used as part of an annotation to specify that the user wants to apply a Bundle.
+type BundleName string
+
+// Validate validates that given flag string values map to actual flags in runsc.
+func (b Bundle) Validate() error {
+	flagSet := flag.NewFlagSet("tmp", flag.ContinueOnError)
+	RegisterFlags(flagSet)
+	for key, val := range b {
+		flag := flagSet.Lookup(key)
+		if flag == nil {
+			return fmt.Errorf("unknown flag %q", key)
+		}
+		if err := flagSet.Set(key, val); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// MetricMetadataKeys is the set of keys of metric metadata labels
+// as returned by `Config.MetricMetadata`.
+var MetricMetadataKeys = []string{
+	"version",
+	"platform",
+	"network",
+	"numcores",
+	"coretags",
+	"overlay",
+	"fsmode",
+	"cpuarch",
+	"go",
+	"experiment",
+}
+
+// MetricMetadata returns key-value pairs that are useful to include in metrics
+// exported about the sandbox this config represents.
+// It must return the same set of labels as listed in `MetricMetadataKeys`.
+func (c *Config) MetricMetadata() map[string]string {
+	var fsMode = "goferfs"
+	if c.DirectFS {
+		fsMode = "directfs"
+	}
+	return map[string]string{
+		"version":  version.Version(),
+		"platform": c.Platform,
+		"network":  c.Network.String(),
+		"numcores": strconv.Itoa(runtime.NumCPU()),
+		"coretags": strconv.FormatBool(c.EnableCoreTags),
+		"overlay":  c.Overlay2.String(),
+		"fsmode":   fsMode,
+		"cpuarch":  runtime.GOARCH,
+		"go":       runtime.Version(),
+		// The "experiment" label is currently unused, but may be used to contain
+		// extra information about e.g. an experiment that may be enabled.
+		"experiment": "",
+	}
 }
 
 // FileAccessType tells how the filesystem is accessed.
@@ -293,7 +480,7 @@ func fileAccessTypePtr(v FileAccessType) *FileAccessType {
 	return &v
 }
 
-// Set implements flag.Value.
+// Set implements flag.Value. Set(String()) should be idempotent.
 func (f *FileAccessType) Set(v string) error {
 	switch v {
 	case "shared":
@@ -307,7 +494,7 @@ func (f *FileAccessType) Set(v string) error {
 }
 
 // Get implements flag.Value.
-func (f *FileAccessType) Get() interface{} {
+func (f *FileAccessType) Get() any {
 	return *f
 }
 
@@ -340,7 +527,7 @@ func networkTypePtr(v NetworkType) *NetworkType {
 	return &v
 }
 
-// Set implements flag.Value.
+// Set implements flag.Value. Set(String()) should be idempotent.
 func (n *NetworkType) Set(v string) error {
 	switch v {
 	case "sandbox":
@@ -356,7 +543,7 @@ func (n *NetworkType) Set(v string) error {
 }
 
 // Get implements flag.Value.
-func (n *NetworkType) Get() interface{} {
+func (n *NetworkType) Get() any {
 	return *n
 }
 
@@ -389,7 +576,7 @@ func queueingDisciplinePtr(v QueueingDiscipline) *QueueingDiscipline {
 	return &v
 }
 
-// Set implements flag.Value.
+// Set implements flag.Value. Set(String()) should be idempotent.
 func (q *QueueingDiscipline) Set(v string) error {
 	switch v {
 	case "none":
@@ -403,7 +590,7 @@ func (q *QueueingDiscipline) Set(v string) error {
 }
 
 // Get implements flag.Value.
-func (q *QueueingDiscipline) Get() interface{} {
+func (q *QueueingDiscipline) Get() any {
 	return *q
 }
 
@@ -418,100 +605,244 @@ func (q QueueingDiscipline) String() string {
 	panic(fmt.Sprintf("Invalid qdisc %d", q))
 }
 
-// controlConfig represents control endpoints.
-type controlConfig struct {
-	Controls *controlpb.ControlConfig
-}
-
-// Set implements flag.Value.
-func (c *controlConfig) Set(v string) error {
-	controls := strings.Split(v, ",")
-	var controlList []controlpb.ControlConfig_Endpoint
-	for _, control := range controls {
-		switch control {
-		case "EVENTS":
-			controlList = append(controlList, controlpb.ControlConfig_EVENTS)
-		case "FS":
-			controlList = append(controlList, controlpb.ControlConfig_FS)
-		case "LIFECYCLE":
-			controlList = append(controlList, controlpb.ControlConfig_LIFECYCLE)
-		case "LOGGING":
-			controlList = append(controlList, controlpb.ControlConfig_LOGGING)
-		case "PROFILE":
-			controlList = append(controlList, controlpb.ControlConfig_PROFILE)
-		case "USAGE":
-			controlList = append(controlList, controlpb.ControlConfig_USAGE)
-		case "PROC":
-			controlList = append(controlList, controlpb.ControlConfig_PROC)
-		case "STATE":
-			controlList = append(controlList, controlpb.ControlConfig_STATE)
-		case "DEBUG":
-			controlList = append(controlList, controlpb.ControlConfig_DEBUG)
-		default:
-			return fmt.Errorf("invalid control %q", control)
-		}
-	}
-	c.Controls.AllowedControls = controlList
-	return nil
-}
-
-// Get implements flag.Value.
-func (c *controlConfig) Get() interface{} {
-	return *c
-}
-
-// String implements flag.Value.
-func (c *controlConfig) String() string {
-	v := ""
-	for _, control := range c.Controls.GetAllowedControls() {
-		if len(v) > 0 {
-			v += ","
-		}
-		switch control {
-		case controlpb.ControlConfig_EVENTS:
-			v += "EVENTS"
-		case controlpb.ControlConfig_FS:
-			v += "FS"
-		case controlpb.ControlConfig_LIFECYCLE:
-			v += "LIFECYCLE"
-		case controlpb.ControlConfig_LOGGING:
-			v += "LOGGING"
-		case controlpb.ControlConfig_PROFILE:
-			v += "PROFILE"
-		case controlpb.ControlConfig_USAGE:
-			v += "USAGE"
-		case controlpb.ControlConfig_PROC:
-			v += "PROC"
-		case controlpb.ControlConfig_STATE:
-			v += "STATE"
-		case controlpb.ControlConfig_DEBUG:
-			v += "DEBUG"
-		default:
-			panic(fmt.Sprintf("Invalid control %d", control))
-		}
-	}
-	return v
-}
-
-func defaultControlConfig() *controlConfig {
-	c := controlConfig{}
-	c.Controls = &controlpb.ControlConfig{}
-	c.Controls.AllowedControls = append(c.Controls.AllowedControls, controlpb.ControlConfig_EVENTS)
-	c.Controls.AllowedControls = append(c.Controls.AllowedControls, controlpb.ControlConfig_FS)
-	c.Controls.AllowedControls = append(c.Controls.AllowedControls, controlpb.ControlConfig_LIFECYCLE)
-	c.Controls.AllowedControls = append(c.Controls.AllowedControls, controlpb.ControlConfig_LOGGING)
-	c.Controls.AllowedControls = append(c.Controls.AllowedControls, controlpb.ControlConfig_PROFILE)
-	c.Controls.AllowedControls = append(c.Controls.AllowedControls, controlpb.ControlConfig_USAGE)
-	c.Controls.AllowedControls = append(c.Controls.AllowedControls, controlpb.ControlConfig_PROC)
-	c.Controls.AllowedControls = append(c.Controls.AllowedControls, controlpb.ControlConfig_STATE)
-	c.Controls.AllowedControls = append(c.Controls.AllowedControls, controlpb.ControlConfig_DEBUG)
-	return &c
-}
-
 func leakModePtr(v refs.LeakMode) *refs.LeakMode {
 	return &v
 }
 
 func watchdogActionPtr(v watchdog.Action) *watchdog.Action {
 	return &v
+}
+
+// HostUDS tells how much of the host UDS the file system has access to.
+type HostUDS int
+
+const (
+	// HostUDSNone doesn't allows UDS from the host to be manipulated.
+	HostUDSNone HostUDS = 0x0
+
+	// HostUDSOpen allows UDS from the host to be opened, e.g. connect(2).
+	HostUDSOpen HostUDS = 0x1
+
+	// HostUDSCreate allows UDS from the host to be created, e.g. bind(2).
+	HostUDSCreate HostUDS = 0x2
+
+	// HostUDSAll allows all form of communication with the host through UDS.
+	HostUDSAll = HostUDSOpen | HostUDSCreate
+)
+
+func hostUDSPtr(v HostUDS) *HostUDS {
+	return &v
+}
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (g *HostUDS) Set(v string) error {
+	switch v {
+	case "", "none":
+		*g = HostUDSNone
+	case "open":
+		*g = HostUDSOpen
+	case "create":
+		*g = HostUDSCreate
+	case "all":
+		*g = HostUDSAll
+	default:
+		return fmt.Errorf("invalid host UDS type %q", v)
+	}
+	return nil
+}
+
+// Get implements flag.Value.
+func (g *HostUDS) Get() any {
+	return *g
+}
+
+// String implements flag.Value.
+func (g HostUDS) String() string {
+	switch g {
+	case HostUDSNone:
+		return "none"
+	case HostUDSOpen:
+		return "open"
+	case HostUDSCreate:
+		return "create"
+	case HostUDSAll:
+		return "all"
+	default:
+		panic(fmt.Sprintf("Invalid host UDS type %d", g))
+	}
+}
+
+// AllowOpen returns true if it can consume UDS from the host.
+func (g HostUDS) AllowOpen() bool {
+	return g&HostUDSOpen != 0
+}
+
+// AllowCreate returns true if it can create UDS in the host.
+func (g HostUDS) AllowCreate() bool {
+	return g&HostUDSCreate != 0
+}
+
+// HostFifo tells how much of the host FIFO (or named pipes) the file system has
+// access to.
+type HostFifo int
+
+const (
+	// HostFifoNone doesn't allow FIFO from the host to be manipulated.
+	HostFifoNone HostFifo = 0x0
+
+	// HostFifoOpen allows FIFOs from the host to be opened.
+	HostFifoOpen HostFifo = 0x1
+)
+
+func hostFifoPtr(v HostFifo) *HostFifo {
+	return &v
+}
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (g *HostFifo) Set(v string) error {
+	switch v {
+	case "", "none":
+		*g = HostFifoNone
+	case "open":
+		*g = HostFifoOpen
+	default:
+		return fmt.Errorf("invalid host fifo type %q", v)
+	}
+	return nil
+}
+
+// Get implements flag.Value.
+func (g *HostFifo) Get() any {
+	return *g
+}
+
+// String implements flag.Value.
+func (g HostFifo) String() string {
+	switch g {
+	case HostFifoNone:
+		return "none"
+	case HostFifoOpen:
+		return "open"
+	default:
+		panic(fmt.Sprintf("Invalid host fifo type %d", g))
+	}
+}
+
+// AllowOpen returns true if it can consume FIFOs from the host.
+func (g HostFifo) AllowOpen() bool {
+	return g&HostFifoOpen != 0
+}
+
+// Overlay2 holds the configuration for setting up overlay filesystems for the
+// container.
+type Overlay2 struct {
+	rootMount bool
+	subMounts bool
+	medium    string
+}
+
+func defaultOverlay2() *Overlay2 {
+	// Rootfs overlay is enabled by default and backed by a file in rootfs itself.
+	return &Overlay2{rootMount: true, subMounts: false, medium: "self"}
+}
+
+// Set implements flag.Value. Set(String()) should be idempotent.
+func (o *Overlay2) Set(v string) error {
+	if v == "none" {
+		o.rootMount = false
+		o.subMounts = false
+		o.medium = ""
+		return nil
+	}
+	vs := strings.Split(v, ":")
+	if len(vs) != 2 {
+		return fmt.Errorf("expected format is --overlay2={mount}:{medium}, got %q", v)
+	}
+
+	switch mount := vs[0]; mount {
+	case "root":
+		o.rootMount = true
+	case "all":
+		o.rootMount = true
+		o.subMounts = true
+	default:
+		return fmt.Errorf("unexpected mount specifier for --overlay2: %q", mount)
+	}
+
+	o.medium = vs[1]
+	switch o.medium {
+	case "memory", "self": // OK
+	default:
+		if !strings.HasPrefix(o.medium, "dir=") {
+			return fmt.Errorf("unexpected medium specifier for --overlay2: %q", o.medium)
+		}
+		if hostFileDir := strings.TrimPrefix(o.medium, "dir="); !filepath.IsAbs(hostFileDir) {
+			return fmt.Errorf("overlay host file directory should be an absolute path, got %q", hostFileDir)
+		}
+	}
+	return nil
+}
+
+// Get implements flag.Value.
+func (o *Overlay2) Get() any {
+	return *o
+}
+
+// String implements flag.Value.
+func (o Overlay2) String() string {
+	if !o.rootMount && !o.subMounts {
+		return "none"
+	}
+	res := ""
+	switch {
+	case o.rootMount && o.subMounts:
+		res = "all"
+	case o.rootMount:
+		res = "root"
+	default:
+		panic("invalid state of subMounts = true and rootMount = false")
+	}
+
+	return res + ":" + o.medium
+}
+
+// Enabled returns true if the overlay option is enabled for any mounts.
+func (o *Overlay2) Enabled() bool {
+	return o.rootMount || o.subMounts
+}
+
+// RootEnabled returns true if the overlay is enabled for the root mount.
+func (o *Overlay2) RootEnabled() bool {
+	return o.rootMount
+}
+
+// SubMountEnabled returns true if the overlay is enabled for submounts.
+func (o *Overlay2) SubMountEnabled() bool {
+	return o.subMounts
+}
+
+// IsBackedByMemory indicates whether the overlay is backed by app memory.
+func (o *Overlay2) IsBackedByMemory() bool {
+	return o.Enabled() && o.medium == "memory"
+}
+
+// IsBackedBySelf indicates whether the overlaid mounts are backed by
+// themselves.
+func (o *Overlay2) IsBackedBySelf() bool {
+	return o.Enabled() && o.medium == "self"
+}
+
+// HostFileDir indicates the directory in which the overlay-backing host file
+// should be created.
+//
+// Precondition: o.IsBackedByHostFile() && !o.IsBackedBySelf().
+func (o *Overlay2) HostFileDir() string {
+	if !strings.HasPrefix(o.medium, "dir=") {
+		panic(fmt.Sprintf("Overlay2.Medium = %q does not have dir= prefix when overlay is backed by a host file", o.medium))
+	}
+	hostFileDir := strings.TrimPrefix(o.medium, "dir=")
+	if !filepath.IsAbs(hostFileDir) {
+		panic(fmt.Sprintf("overlay host file directory should be an absolute path, got %q", hostFileDir))
+	}
+	return hostFileDir
 }

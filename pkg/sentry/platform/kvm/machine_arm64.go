@@ -18,6 +18,7 @@
 package kvm
 
 import (
+	"fmt"
 	"runtime"
 
 	"golang.org/x/sys/unix"
@@ -65,7 +66,7 @@ func (m *machine) mapUpperHalf(pageTable *pagetables.PageTables) {
 // physical regions form them.
 func archPhysicalRegions(physicalRegions []physicalRegion) []physicalRegion {
 	rdRegions := []virtualRegion{}
-	applyVirtualRegions(func(vr virtualRegion) {
+	if err := applyVirtualRegions(func(vr virtualRegion) {
 		if excludeVirtualRegion(vr) {
 			return // skip region.
 		}
@@ -74,7 +75,9 @@ func archPhysicalRegions(physicalRegions []physicalRegion) []physicalRegion {
 		if !vr.accessType.Write && vr.accessType.Read {
 			rdRegions = append(rdRegions, vr)
 		}
-	})
+	}); err != nil {
+		panic(fmt.Sprintf("error parsing /proc/self/maps: %v", err))
+	}
 
 	// Add an unreachable region.
 	rdRegions = append(rdRegions, virtualRegion{
@@ -168,7 +171,7 @@ func isWriteFault(code uint64) bool {
 //go:nosplit
 func (c *vCPU) fault(signal int32, info *linux.SignalInfo) (hostarch.AccessType, error) {
 	bluepill(c) // Probably no-op, but may not be.
-	faultAddr := c.GetFaultAddr()
+	faultAddr := c.FaultAddr()
 	code, user := c.ErrorCode()
 	if !user {
 		// The last fault serviced by this CPU was not a user
@@ -205,7 +208,7 @@ func (c *vCPU) fault(signal int32, info *linux.SignalInfo) (hostarch.AccessType,
 // getMaxVCPU get max vCPU number
 func (m *machine) getMaxVCPU() {
 	rmaxVCPUs := runtime.NumCPU()
-	smaxVCPUs, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), _KVM_CHECK_EXTENSION, _KVM_CAP_MAX_VCPUS)
+	smaxVCPUs, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), KVM_CHECK_EXTENSION, _KVM_CAP_MAX_VCPUS)
 	// compare the max vcpu number from runtime and syscall, use smaller one.
 	if errno != 0 {
 		m.maxVCPUs = rmaxVCPUs

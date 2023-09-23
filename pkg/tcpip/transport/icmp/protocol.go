@@ -20,7 +20,6 @@ import (
 	"fmt"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/raw"
@@ -87,7 +86,7 @@ func (p *protocol) MinimumPacketSize() int {
 }
 
 // ParsePorts in case of ICMP sets src to 0, dst to ICMP ID, and err to nil.
-func (p *protocol) ParsePorts(v buffer.View) (src, dst uint16, err tcpip.Error) {
+func (p *protocol) ParsePorts(v []byte) (src, dst uint16, err tcpip.Error) {
 	switch p.number {
 	case ProtocolNumber4:
 		hdr := header.ICMPv4(v)
@@ -101,7 +100,7 @@ func (p *protocol) ParsePorts(v buffer.View) (src, dst uint16, err tcpip.Error) 
 
 // HandleUnknownDestinationPacket handles packets targeted at this protocol but
 // that don't match any existing endpoint.
-func (*protocol) HandleUnknownDestinationPacket(stack.TransportEndpointID, *stack.PacketBuffer) stack.UnknownDestinationPacketDisposition {
+func (*protocol) HandleUnknownDestinationPacket(stack.TransportEndpointID, stack.PacketBufferPtr) stack.UnknownDestinationPacketDisposition {
 	return stack.UnknownDestinationPacketHandled
 }
 
@@ -128,7 +127,7 @@ func (*protocol) Pause() {}
 func (*protocol) Resume() {}
 
 // Parse implements stack.TransportProtocol.Parse.
-func (*protocol) Parse(pkt *stack.PacketBuffer) bool {
+func (*protocol) Parse(pkt stack.PacketBufferPtr) bool {
 	// Right now, the Parse() method is tied to enabled protocols passed into
 	// stack.New. This works for UDP and TCP, but we handle ICMP traffic even
 	// when netstack users don't pass ICMP as a supported protocol.

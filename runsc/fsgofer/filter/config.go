@@ -53,6 +53,7 @@ var allowedSyscalls = seccomp.SyscallRules{
 		},
 	},
 	unix.SYS_FCHMOD:   {},
+	unix.SYS_FCHMODAT: {},
 	unix.SYS_FCHOWNAT: {},
 	unix.SYS_FCNTL: []seccomp.Rule{
 		{
@@ -211,7 +212,7 @@ var allowedSyscalls = seccomp.SyscallRules{
 	unix.SYS_WRITE:     {},
 }
 
-var udsSyscalls = seccomp.SyscallRules{
+var udsCommonSyscalls = seccomp.SyscallRules{
 	unix.SYS_SOCKET: []seccomp.Rule{
 		{
 			seccomp.EqualTo(unix.AF_UNIX),
@@ -229,11 +230,16 @@ var udsSyscalls = seccomp.SyscallRules{
 			seccomp.EqualTo(0),
 		},
 	},
-	unix.SYS_CONNECT: []seccomp.Rule{
-		{
-			seccomp.MatchAny{},
-		},
-	},
+}
+
+var udsOpenSyscalls = seccomp.SyscallRules{
+	unix.SYS_CONNECT: {},
+}
+
+var udsCreateSyscalls = seccomp.SyscallRules{
+	unix.SYS_ACCEPT4: {},
+	unix.SYS_BIND:    {},
+	unix.SYS_LISTEN:  {},
 }
 
 var xattrSyscalls = seccomp.SyscallRules{

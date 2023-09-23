@@ -58,7 +58,7 @@ func (s *evictableRangeSet) afterLoad() {}
 
 // +checklocksignore
 func (s *evictableRangeSet) StateLoad(stateSourceObject state.Source) {
-	stateSourceObject.LoadValue(0, new(*evictableRangeSegmentDataSlices), func(y interface{}) { s.loadRoot(y.(*evictableRangeSegmentDataSlices)) })
+	stateSourceObject.LoadValue(0, new(*evictableRangeSegmentDataSlices), func(y any) { s.loadRoot(y.(*evictableRangeSegmentDataSlices)) })
 }
 
 func (n *evictableRangenode) StateTypeName() string {
@@ -147,6 +147,7 @@ func (u *usageInfo) StateFields() []string {
 		"kind",
 		"knownCommitted",
 		"refs",
+		"memCgID",
 	}
 }
 
@@ -158,6 +159,7 @@ func (u *usageInfo) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &u.kind)
 	stateSinkObject.Save(1, &u.knownCommitted)
 	stateSinkObject.Save(2, &u.refs)
+	stateSinkObject.Save(3, &u.memCgID)
 }
 
 func (u *usageInfo) afterLoad() {}
@@ -167,6 +169,7 @@ func (u *usageInfo) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &u.kind)
 	stateSourceObject.Load(1, &u.knownCommitted)
 	stateSourceObject.Load(2, &u.refs)
+	stateSourceObject.Load(3, &u.memCgID)
 }
 
 func (s *reclaimSet) StateTypeName() string {
@@ -193,7 +196,7 @@ func (s *reclaimSet) afterLoad() {}
 
 // +checklocksignore
 func (s *reclaimSet) StateLoad(stateSourceObject state.Source) {
-	stateSourceObject.LoadValue(0, new(*reclaimSegmentDataSlices), func(y interface{}) { s.loadRoot(y.(*reclaimSegmentDataSlices)) })
+	stateSourceObject.LoadValue(0, new(*reclaimSegmentDataSlices), func(y any) { s.loadRoot(y.(*reclaimSegmentDataSlices)) })
 }
 
 func (n *reclaimnode) StateTypeName() string {
@@ -297,7 +300,7 @@ func (s *usageSet) afterLoad() {}
 
 // +checklocksignore
 func (s *usageSet) StateLoad(stateSourceObject state.Source) {
-	stateSourceObject.LoadValue(0, new(*usageSegmentDataSlices), func(y interface{}) { s.loadRoot(y.(*usageSegmentDataSlices)) })
+	stateSourceObject.LoadValue(0, new(*usageSegmentDataSlices), func(y any) { s.loadRoot(y.(*usageSegmentDataSlices)) })
 }
 
 func (n *usagenode) StateTypeName() string {

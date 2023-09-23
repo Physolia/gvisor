@@ -26,17 +26,19 @@ import (
 	"time"
 
 	"github.com/containerd/console"
+
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/pkg/process"
 	"github.com/containerd/containerd/pkg/stdio"
+
 	"github.com/containerd/fifo"
 	runc "github.com/containerd/go-runc"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
-
 	"gvisor.dev/gvisor/pkg/shim/runsc"
+	"gvisor.dev/gvisor/pkg/shim/utils"
 )
 
 const statusStopped = "stopped"
@@ -77,7 +79,7 @@ type Init struct {
 }
 
 // NewRunsc returns a new runsc instance for a process.
-func NewRunsc(root, path, namespace, runtime string, config map[string]string) *runsc.Runsc {
+func NewRunsc(root, path, namespace, runtime string, config map[string]string, spec *specs.Spec) *runsc.Runsc {
 	if root == "" {
 		root = RunscRoot
 	}
@@ -86,6 +88,7 @@ func NewRunsc(root, path, namespace, runtime string, config map[string]string) *
 		PdeathSignal: unix.SIGKILL,
 		Log:          filepath.Join(path, "log.json"),
 		LogFormat:    runc.JSON,
+		PanicLog:     utils.PanicLogPath(spec),
 		Root:         filepath.Join(root, namespace),
 		Config:       config,
 	}

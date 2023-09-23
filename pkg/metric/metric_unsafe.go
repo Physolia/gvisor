@@ -33,13 +33,11 @@ func snapshotDistribution(samples []atomicbitops.Uint64) []uint64 {
 	// no race condition from getting the number of buckets upfront.
 	numBuckets := len(samples)
 	snapshot := make([]uint64, numBuckets)
-	samplesHeader := (*gohacks.SliceHeader)(unsafe.Pointer(&samples))
-	snapshotHeader := (*gohacks.SliceHeader)(unsafe.Pointer(&snapshot))
 	if sync.RaceEnabled {
 		// runtime.RaceDisable() doesn't actually stop the race detector, so it
 		// can't help us here. Instead, call runtime.memmove directly, which is
 		// not instrumented by the race detector.
-		gohacks.Memmove(snapshotHeader.Data, samplesHeader.Data, unsafe.Sizeof(uint64(0))*uintptr(numBuckets))
+		gohacks.Memmove(unsafe.Pointer(&snapshot[0]), unsafe.Pointer(&samples[0]), unsafe.Sizeof(uint64(0))*uintptr(numBuckets))
 	} else {
 		for i := range samples {
 			snapshot[i] = samples[i].RacyLoad()
@@ -49,6 +47,7 @@ func snapshotDistribution(samples []atomicbitops.Uint64) []uint64 {
 }
 
 // CheapNowNano returns the current unix timestamp in nanoseconds.
+//
 //go:nosplit
 func CheapNowNano() int64 {
 	return gohacks.Nanotime()

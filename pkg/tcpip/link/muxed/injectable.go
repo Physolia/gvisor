@@ -16,6 +16,9 @@
 package muxed
 
 import (
+	"sync"
+
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -26,7 +29,10 @@ import (
 // will be written to. Note that HandleLocal works differently for this
 // endpoint (see WritePacket).
 type InjectableEndpoint struct {
-	routes     map[tcpip.Address]stack.InjectableLinkEndpoint
+	routes map[tcpip.Address]stack.InjectableLinkEndpoint
+
+	mu sync.RWMutex
+	// +checklocks:mu
 	dispatcher stack.NetworkDispatcher
 }
 
@@ -71,17 +77,24 @@ func (m *InjectableEndpoint) Attach(dispatcher stack.NetworkDispatcher) {
 	for _, endpoint := range m.routes {
 		endpoint.Attach(dispatcher)
 	}
+	m.mu.Lock()
 	m.dispatcher = dispatcher
+	m.mu.Unlock()
 }
 
 // IsAttached implements stack.LinkEndpoint.
 func (m *InjectableEndpoint) IsAttached() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.dispatcher != nil
 }
 
 // InjectInbound implements stack.InjectableLinkEndpoint.
-func (m *InjectableEndpoint) InjectInbound(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
-	m.dispatcher.DeliverNetworkPacket(protocol, pkt)
+func (m *InjectableEndpoint) InjectInbound(protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr) {
+	m.mu.RLock()
+	d := m.dispatcher
+	m.mu.RUnlock()
+	d.DeliverNetworkPacket(protocol, pkt)
 }
 
 // WritePackets writes outbound packets to the appropriate
@@ -89,16 +102,14 @@ func (m *InjectableEndpoint) InjectInbound(protocol tcpip.NetworkProtocolNumber,
 // pkt.EgressRoute.RemoteAddress has a route registered in this endpoint.
 func (m *InjectableEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
 	i := 0
-	for pkt := pkts.Front(); pkt != nil; {
-		nextPkt := pkt.Next()
-
+	for _, pkt := range pkts.AsSlice() {
 		endpoint, ok := m.routes[pkt.EgressRoute.RemoteAddress]
 		if !ok {
-			return i, &tcpip.ErrNoRoute{}
+			return i, &tcpip.ErrHostUnreachable{}
 		}
 
 		var tmpPkts stack.PacketBufferList
-		tmpPkts.PushFront(pkt)
+		tmpPkts.PushBack(pkt)
 
 		n, err := endpoint.WritePackets(tmpPkts)
 		if err != nil {
@@ -106,7 +117,6 @@ func (m *InjectableEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcp
 		}
 
 		i += n
-		pkt = nextPkt
 	}
 
 	return i, nil
@@ -114,10 +124,10 @@ func (m *InjectableEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcp
 
 // InjectOutbound writes outbound packets to the appropriate
 // LinkInjectableEndpoint based on the dest address.
-func (m *InjectableEndpoint) InjectOutbound(dest tcpip.Address, packet []byte) tcpip.Error {
+func (m *InjectableEndpoint) InjectOutbound(dest tcpip.Address, packet *buffer.View) tcpip.Error {
 	endpoint, ok := m.routes[dest]
 	if !ok {
-		return &tcpip.ErrNoRoute{}
+		return &tcpip.ErrHostUnreachable{}
 	}
 	return endpoint.InjectOutbound(dest, packet)
 }
@@ -135,7 +145,10 @@ func (*InjectableEndpoint) ARPHardwareType() header.ARPHardwareType {
 }
 
 // AddHeader implements stack.LinkEndpoint.AddHeader.
-func (*InjectableEndpoint) AddHeader(*stack.PacketBuffer) {}
+func (*InjectableEndpoint) AddHeader(stack.PacketBufferPtr) {}
+
+// ParseHeader implements stack.LinkEndpoint.ParseHeader.
+func (*InjectableEndpoint) ParseHeader(stack.PacketBufferPtr) bool { return true }
 
 // NewInjectableEndpoint creates a new multi-endpoint injectable endpoint.
 func NewInjectableEndpoint(routes map[tcpip.Address]stack.InjectableLinkEndpoint) *InjectableEndpoint {

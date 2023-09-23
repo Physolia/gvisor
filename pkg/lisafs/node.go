@@ -15,8 +15,7 @@
 package lisafs
 
 import (
-	"sync/atomic"
-
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -35,7 +34,7 @@ const numStaticChildren = 5
 // one Node for a given filesystem position.
 //
 // Reference Model:
-// * Each node holds a ref on its parent for its entire lifetime.
+//   - Each node holds a ref on its parent for its entire lifetime.
 type Node struct {
 	// node's ref count is protected by its parent's childrenMu.
 	nodeRefs
@@ -43,7 +42,7 @@ type Node struct {
 	// opMu synchronizes high level operations on this path.
 	//
 	// It is used to ensure the following which are important for security:
-	// * This node's data is protected by opMu. So all operations that change its
+	//	* This node's data is protected by opMu. So all operations that change its
 	//   data should hold opMu for writing. For example: write, setstat, setxattr,
 	//   etc. This entails that if this node represents a directory, creation and
 	//   deletion operations happening directly under this directory must lock
@@ -51,7 +50,7 @@ type Node struct {
 	//   reading. This is to avoid the can of worms that open when creation and
 	//   deletion are allowed to race. This prevents any walks from occurring
 	//   during creation or deletion.
-	// * When this node is being deleted, the deletion handler must hold opMu for
+	//	* When this node is being deleted, the deletion handler must hold opMu for
 	//   writing. This ensures that there are no concurrent operations going on
 	//   this node while it is being deleted and potentially being replaced with
 	//   something hazardous.
@@ -69,7 +68,7 @@ type Node struct {
 	// anymore. This node may have been replaced with something hazardous.
 	// deleted is protected by opMu. deleted must only be accessed/mutated using
 	// atomics; see markDeletedRecursive for more details.
-	deleted uint32
+	deleted atomicbitops.Uint32
 
 	// name is the name of the file represented by this Node in parent. If this
 	// FD represents the root directory, then name is an empty string. name is
@@ -102,9 +101,9 @@ type Node struct {
 	dynamicChildren map[string]*Node
 }
 
-// DecRef implements refsvfs2.RefCounter.DecRef. Note that the context
+// DecRef implements refs.RefCounter.DecRef. Note that the context
 // parameter should never be used. It exists solely to comply with the
-// refsvfs2.RefCounter interface.
+// refs.RefCounter interface.
 //
 // Precondition: server's rename mutex must be at least read locked.
 func (n *Node) DecRef(context.Context) {
@@ -170,8 +169,8 @@ func (n *Node) WithChildrenMu(fn func()) {
 // because all internal (non-leaf) nodes are directories.
 //
 // Precondition:
-// * server's rename mutex must be at least read locked. Calling handlers must
-//   at least have read concurrency guarantee from the server.
+//   - server's rename mutex must be at least read locked. Calling handlers must
+//     at least have read concurrency guarantee from the server.
 func (n *Node) FilePath() string {
 	// Walk upwards and prepend name to res.
 	var res fspath.Builder
@@ -185,7 +184,7 @@ func (n *Node) FilePath() string {
 }
 
 func (n *Node) isDeleted() bool {
-	return atomic.LoadUint32(&n.deleted) != 0
+	return n.deleted.Load() != 0
 }
 
 func (n *Node) removeFD(fd *ControlFD) {
@@ -279,7 +278,7 @@ func (n *Node) forEachChild(fn func(*Node)) {
 // Precondition: opMu must be locked for writing on the root node being marked
 // as deleted.
 func (n *Node) markDeletedRecursive() {
-	atomic.StoreUint32(&n.deleted, 1)
+	n.deleted.Store(1)
 
 	// No need to hold opMu for children as it introduces lock ordering issues
 	// because forEachChild locks childrenMu. Locking opMu after childrenMu

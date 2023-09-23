@@ -25,13 +25,13 @@ package sharedmem
 
 import (
 	"fmt"
-	"sync/atomic"
 
+	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/eventfd"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/rawfile"
 	"gvisor.dev/gvisor/pkg/tcpip/link/sharedmem/queue"
@@ -133,7 +133,14 @@ type Options struct {
 	// VirtioNetHeaderRequired if true, indicates that all outbound packets should have
 	// a virtio header and inbound packets should have a virtio header as well.
 	VirtioNetHeaderRequired bool
+
+	// GSOMaxSize is the maximum GSO packet size. It is zero if GSO is
+	// disabled. Note that only gVisor GSO is supported, not host GSO.
+	GSOMaxSize uint32
 }
+
+var _ stack.LinkEndpoint = (*endpoint)(nil)
+var _ stack.GSOEndpoint = (*endpoint)(nil)
 
 type endpoint struct {
 	// mtu (maximum transmission unit) is the maximum size of a packet.
@@ -160,6 +167,11 @@ type endpoint struct {
 	// hdrSize is immutable.
 	hdrSize uint32
 
+	// gSOMaxSize is the maximum GSO packet size. It is zero if GSO is
+	// disabled. Note that only gVisor GSO is supported, not host GSO.
+	// gsoMaxSize is immutable.
+	gsoMaxSize uint32
+
 	// virtioNetHeaderRequired if true indicates that a virtio header is expected
 	// in all inbound/outbound packets.
 	virtioNetHeaderRequired bool
@@ -167,9 +179,8 @@ type endpoint struct {
 	// rx is the receive queue.
 	rx rx
 
-	// stopRequested is to be accessed atomically only, and determines if
-	// the worker goroutines should stop.
-	stopRequested uint32
+	// stopRequested  determines whether the worker goroutines should stop.
+	stopRequested atomicbitops.Uint32
 
 	// Wait group used to indicate that all workers have stopped.
 	completed sync.WaitGroup
@@ -192,6 +203,9 @@ type endpoint struct {
 
 // New creates a new shared-memory-based endpoint. Buffers will be broken up
 // into buffers of "bufferSize" bytes.
+//
+// In order to release all resources held by the returned endpoint, Close()
+// must be called followed by Wait().
 func New(opts Options) (stack.LinkEndpoint, error) {
 	e := &endpoint{
 		mtu:                     opts.MTU,
@@ -200,6 +214,7 @@ func New(opts Options) (stack.LinkEndpoint, error) {
 		peerFD:                  opts.PeerFD,
 		onClosed:                opts.OnClosed,
 		virtioNetHeaderRequired: opts.VirtioNetHeaderRequired,
+		gsoMaxSize:              opts.GSOMaxSize,
 	}
 
 	if err := e.tx.init(opts.BufferSize, &opts.TX); err != nil {
@@ -232,11 +247,12 @@ func New(opts Options) (stack.LinkEndpoint, error) {
 	return e, nil
 }
 
-// Close frees all resources associated with the endpoint.
+// Close frees most resources associated with the endpoint. Wait() must be
+// called after Close() in order to free the rest.
 func (e *endpoint) Close() {
 	// Tell dispatch goroutine to stop, then write to the eventfd so that
 	// it wakes up in case it's sleeping.
-	atomic.StoreUint32(&e.stopRequested, 1)
+	e.stopRequested.Store(1)
 	e.rx.eventFD.Notify()
 
 	// Cleanup the queues inline if the worker hasn't started yet; we also
@@ -255,13 +271,18 @@ func (e *endpoint) Close() {
 // stopped after a Close() call.
 func (e *endpoint) Wait() {
 	e.completed.Wait()
+	e.rx.eventFD.Close()
 }
 
 // Attach implements stack.LinkEndpoint.Attach. It launches the goroutine that
 // reads packets from the rx queue.
 func (e *endpoint) Attach(dispatcher stack.NetworkDispatcher) {
+	if dispatcher == nil {
+		e.Close()
+		return
+	}
 	e.mu.Lock()
-	if !e.workerStarted && atomic.LoadUint32(&e.stopRequested) == 0 {
+	if !e.workerStarted && e.stopRequested.Load() == 0 {
 		e.workerStarted = true
 		e.completed.Add(1)
 
@@ -319,7 +340,7 @@ func (e *endpoint) LinkAddress() tcpip.LinkAddress {
 }
 
 // AddHeader implements stack.LinkEndpoint.AddHeader.
-func (e *endpoint) AddHeader(pkt *stack.PacketBuffer) {
+func (e *endpoint) AddHeader(pkt stack.PacketBufferPtr) {
 	// Add ethernet header if needed.
 	if len(e.addr) == 0 {
 		return
@@ -333,20 +354,36 @@ func (e *endpoint) AddHeader(pkt *stack.PacketBuffer) {
 	})
 }
 
-func (e *endpoint) AddVirtioNetHeader(pkt *stack.PacketBuffer) {
+func (e *endpoint) parseHeader(pkt stack.PacketBufferPtr) bool {
+	_, ok := pkt.LinkHeader().Consume(header.EthernetMinimumSize)
+	return ok
+}
+
+// ParseHeader implements stack.LinkEndpoint.ParseHeader.
+func (e *endpoint) ParseHeader(pkt stack.PacketBufferPtr) bool {
+	// Add ethernet header if needed.
+	if len(e.addr) == 0 {
+		return true
+	}
+
+	return e.parseHeader(pkt)
+}
+
+func (e *endpoint) AddVirtioNetHeader(pkt stack.PacketBufferPtr) {
 	virtio := header.VirtioNetHeader(pkt.VirtioNetHeader().Push(header.VirtioNetHeaderSize))
 	virtio.Encode(&header.VirtioNetHeaderFields{})
 }
 
 // +checklocks:e.mu
-func (e *endpoint) writePacketLocked(r stack.RouteInfo, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
+func (e *endpoint) writePacketLocked(r stack.RouteInfo, protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr) tcpip.Error {
 	if e.virtioNetHeaderRequired {
 		e.AddVirtioNetHeader(pkt)
 	}
 
-	views := pkt.Views()
 	// Transmit the packet.
-	ok := e.tx.transmit(views...)
+	b := pkt.ToBuffer()
+	defer b.Release()
+	ok := e.tx.transmit(b)
 	if !ok {
 		return &tcpip.ErrWouldBlock{}
 	}
@@ -360,7 +397,7 @@ func (e *endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) 
 	var err tcpip.Error
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
+	for _, pkt := range pkts.AsSlice() {
 		if err = e.writePacketLocked(pkt.EgressRoute, pkt.NetworkProtocolNumber, pkt); err != nil {
 			break
 		}
@@ -396,23 +433,24 @@ func (e *endpoint) dispatchLoop(d stack.NetworkDispatcher) {
 
 	// Read in a loop until a stop is requested.
 	var rxb []queue.RxBuffer
-	for atomic.LoadUint32(&e.stopRequested) == 0 {
+	for e.stopRequested.Load() == 0 {
 		var n uint32
 		rxb, n = e.rx.postAndReceive(rxb, &e.stopRequested)
 
 		// Copy data from the shared area to its own buffer, then
 		// prepare to repost the buffer.
-		b := make([]byte, n)
+		v := buffer.NewView(int(n))
+		v.Grow(int(n))
 		offset := uint32(0)
 		for i := range rxb {
-			copy(b[offset:], e.rx.data[rxb[i].Offset:][:rxb[i].Size])
+			v.WriteAt(e.rx.data[rxb[i].Offset:][:rxb[i].Size], int(offset))
 			offset += rxb[i].Size
 
 			rxb[i].Size = e.bufferSize
 		}
 
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-			Data: buffer.View(b).ToVectorisedView(),
+			Payload: buffer.MakeWithView(v),
 		})
 
 		if e.virtioNetHeaderRequired {
@@ -424,13 +462,12 @@ func (e *endpoint) dispatchLoop(d stack.NetworkDispatcher) {
 		}
 
 		var proto tcpip.NetworkProtocolNumber
-		if e.addr != "" {
-			hdr, ok := pkt.LinkHeader().Consume(header.EthernetMinimumSize)
-			if !ok {
+		if len(e.addr) != 0 {
+			if !e.parseHeader(pkt) {
 				pkt.DecRef()
 				continue
 			}
-			proto = header.Ethernet(hdr).Type()
+			proto = header.Ethernet(pkt.LinkHeader().Slice()).Type()
 		} else {
 			// We don't get any indication of what the packet is, so try to guess
 			// if it's an IPv4 or IPv6 packet.
@@ -469,4 +506,14 @@ func (e *endpoint) dispatchLoop(d stack.NetworkDispatcher) {
 // ARPHardwareType implements stack.LinkEndpoint.ARPHardwareType
 func (*endpoint) ARPHardwareType() header.ARPHardwareType {
 	return header.ARPHardwareEther
+}
+
+// GSOMaxSize implements stack.GSOEndpoint.
+func (e *endpoint) GSOMaxSize() uint32 {
+	return e.gsoMaxSize
+}
+
+// SupportsGSO implements stack.GSOEndpoint.
+func (e *endpoint) SupportedGSO() stack.SupportedGSO {
+	return stack.GvisorGSOSupported
 }

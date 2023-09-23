@@ -40,6 +40,14 @@ import (
 	"gvisor.dev/gvisor/runsc/flag"
 )
 
+const (
+	annotationFlagPrefix            = "dev.gvisor.flag."
+	annotationSeccomp               = "dev.gvisor.internal.seccomp."
+	annotationSeccompRuntimeDefault = "RuntimeDefault"
+
+	annotationContainerName = "io.kubernetes.cri.container-name"
+)
+
 // ExePath must point to runsc binary, which is normally the same binary. It's
 // changed in tests that aren't linked in the same binary.
 var ExePath = "/proc/self/exe"
@@ -47,8 +55,8 @@ var ExePath = "/proc/self/exe"
 // Version is the supported spec version.
 var Version = specs.Version
 
-// LogSpec logs the spec in a human-friendly way.
-func LogSpec(orig *specs.Spec) {
+// LogSpecDebug writes the spec in a human-friendly format to the debug log.
+func LogSpecDebug(orig *specs.Spec, logSeccomp bool) {
 	if !log.IsLogging(log.Debug) {
 		return
 	}
@@ -59,7 +67,9 @@ func LogSpec(orig *specs.Spec) {
 		spec.Process.Capabilities = nil
 	}
 	if spec.Linux != nil {
-		spec.Linux.Seccomp = nil
+		if !logSeccomp {
+			spec.Linux.Seccomp = nil
+		}
 		spec.Linux.MaskedPaths = nil
 		spec.Linux.ReadonlyPaths = nil
 		if spec.Linux.Resources != nil {
@@ -168,8 +178,12 @@ func ReadSpec(bundleDir string, conf *config.Config) (*specs.Spec, error) {
 	return ReadSpecFromFile(bundleDir, specFile, conf)
 }
 
-// ReadSpecFromFile reads an OCI runtime spec from the given File, and
-// normalizes all relative paths into absolute by prepending the bundle dir.
+// ReadSpecFromFile reads an OCI runtime spec from the given file. It also fixes
+// up the spec so that the rest of the code doesn't need to worry about it.
+//  1. Normalizes all relative paths into absolute by prepending the bundle
+//     dir to them.
+//  2. Looks for flag overrides and applies them if any.
+//  3. Removes seccomp rules if `RuntimeDefault` was used.
 func ReadSpecFromFile(bundleDir string, specFile *os.File, conf *config.Config) (*specs.Spec, error) {
 	if _, err := specFile.Seek(0, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("error seeking to beginning of file %q: %v", specFile.Name(), err)
@@ -185,6 +199,13 @@ func ReadSpecFromFile(bundleDir string, specFile *os.File, conf *config.Config) 
 	if err := ValidateSpec(&spec); err != nil {
 		return nil, err
 	}
+	if err := fixSpec(&spec, bundleDir, conf); err != nil {
+		return nil, err
+	}
+	return &spec, nil
+}
+
+func fixSpec(spec *specs.Spec, bundleDir string, conf *config.Config) error {
 	// Turn any relative paths in the spec to absolute by prepending the bundleDir.
 	spec.Root.Path = absPath(bundleDir, spec.Root.Path)
 	for i := range spec.Mounts {
@@ -193,21 +214,64 @@ func ReadSpecFromFile(bundleDir string, specFile *os.File, conf *config.Config) 
 			m.Source = absPath(bundleDir, m.Source)
 		}
 	}
-
-	// Override flags using annotation to allow customization per sandbox
-	// instance.
+	// Look for config bundle annotations and verify that they exist.
+	const configBundlePrefix = "dev.gvisor.bundle."
+	var bundles []config.BundleName
 	for annotation, val := range spec.Annotations {
-		const flagPrefix = "dev.gvisor.flag."
-		if strings.HasPrefix(annotation, flagPrefix) {
-			name := annotation[len(flagPrefix):]
-			log.Infof("Overriding flag: %s=%q", name, val)
-			if err := conf.Override(flag.CommandLine, name, val); err != nil {
-				return nil, err
-			}
+		if !strings.HasPrefix(annotation, configBundlePrefix) {
+			continue
+		}
+		if val != "true" {
+			return fmt.Errorf("invalid value %q for annotation %q (must be set to 'true' or removed entirely)", val, annotation)
+		}
+		bundleName := config.BundleName(annotation[len(configBundlePrefix):])
+		if _, exists := config.Bundles[bundleName]; !exists {
+			log.Warningf("Bundle name %q (from annotation %q=%q) does not exist; this bundle may have been deprecated. Skipping.", bundleName, annotation, val)
+			continue
+		}
+		bundles = append(bundles, bundleName)
+	}
+
+	// Apply config bundles, if any.
+	if len(bundles) > 0 {
+		log.Infof("Applying config bundles: %v", bundles)
+		if err := conf.ApplyBundles(flag.CommandLine, bundles...); err != nil {
+			return err
 		}
 	}
 
-	return &spec, nil
+	// Check annotation to see if container name is available.
+	var containerName string
+	for key, val := range spec.Annotations {
+		if key == annotationContainerName {
+			containerName = val
+			log.Debugf("Container name: %q", containerName)
+			break
+		}
+	}
+	for annotation, val := range spec.Annotations {
+		if strings.HasPrefix(annotation, annotationFlagPrefix) {
+			// Override flags using annotation to allow customization per sandbox
+			// instance.
+			name := annotation[len(annotationFlagPrefix):]
+			log.Infof("Overriding flag from flag annotation: --%s=%q", name, val)
+			if err := conf.Override(flag.CommandLine, name, val /* force= */, false); err != nil {
+				return err
+			}
+		} else if len(containerName) > 0 {
+			// If we know the container name, then check to see if seccomp
+			// instructions were given to the the container.
+			if annotation == annotationSeccomp+containerName && val == annotationSeccompRuntimeDefault {
+				// Container seccomp rules are redundant when using gVisor, so remove
+				// them when seccomp is set to RuntimeDefault.
+				if spec.Linux != nil && spec.Linux.Seccomp != nil {
+					log.Debugf("Seccomp is being ignored because annotation %q is set to default.", annotationSeccomp)
+					spec.Linux.Seccomp = nil
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // ReadMounts reads mount list from a file.
@@ -276,45 +340,94 @@ func AllCapabilitiesUint64() uint64 {
 	return rv
 }
 
+// MergeCapabilities merges the capabilites from first and second.
+func MergeCapabilities(first, second *specs.LinuxCapabilities) *specs.LinuxCapabilities {
+	return &specs.LinuxCapabilities{
+		Bounding:    mergeUnique(first.Bounding, second.Bounding),
+		Effective:   mergeUnique(first.Effective, second.Effective),
+		Inheritable: mergeUnique(first.Inheritable, second.Inheritable),
+		Permitted:   mergeUnique(first.Permitted, second.Permitted),
+		Ambient:     mergeUnique(first.Ambient, second.Ambient),
+	}
+}
+
+// DropCapability removes the specified capability from all capability sets.
+func DropCapability(caps *specs.LinuxCapabilities, drop string) {
+	caps.Bounding = remove(caps.Bounding, drop)
+	caps.Effective = remove(caps.Effective, drop)
+	caps.Inheritable = remove(caps.Inheritable, drop)
+	caps.Permitted = remove(caps.Permitted, drop)
+	caps.Ambient = remove(caps.Ambient, drop)
+}
+
+func mergeUnique(strSlices ...[]string) []string {
+	common := make(map[string]struct{})
+	for _, strSlice := range strSlices {
+		for _, s := range strSlice {
+			common[s] = struct{}{}
+		}
+	}
+
+	res := make([]string, 0, len(common))
+	for s := range common {
+		res = append(res, s)
+	}
+	return res
+}
+
+func remove(ss []string, rem string) []string {
+	var out []string
+	for _, s := range ss {
+		if s == rem {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
 var capFromName = map[string]linux.Capability{
-	"CAP_CHOWN":            linux.CAP_CHOWN,
-	"CAP_DAC_OVERRIDE":     linux.CAP_DAC_OVERRIDE,
-	"CAP_DAC_READ_SEARCH":  linux.CAP_DAC_READ_SEARCH,
-	"CAP_FOWNER":           linux.CAP_FOWNER,
-	"CAP_FSETID":           linux.CAP_FSETID,
-	"CAP_KILL":             linux.CAP_KILL,
-	"CAP_SETGID":           linux.CAP_SETGID,
-	"CAP_SETUID":           linux.CAP_SETUID,
-	"CAP_SETPCAP":          linux.CAP_SETPCAP,
-	"CAP_LINUX_IMMUTABLE":  linux.CAP_LINUX_IMMUTABLE,
-	"CAP_NET_BIND_SERVICE": linux.CAP_NET_BIND_SERVICE,
-	"CAP_NET_BROADCAST":    linux.CAP_NET_BROADCAST,
-	"CAP_NET_ADMIN":        linux.CAP_NET_ADMIN,
-	"CAP_NET_RAW":          linux.CAP_NET_RAW,
-	"CAP_IPC_LOCK":         linux.CAP_IPC_LOCK,
-	"CAP_IPC_OWNER":        linux.CAP_IPC_OWNER,
-	"CAP_SYS_MODULE":       linux.CAP_SYS_MODULE,
-	"CAP_SYS_RAWIO":        linux.CAP_SYS_RAWIO,
-	"CAP_SYS_CHROOT":       linux.CAP_SYS_CHROOT,
-	"CAP_SYS_PTRACE":       linux.CAP_SYS_PTRACE,
-	"CAP_SYS_PACCT":        linux.CAP_SYS_PACCT,
-	"CAP_SYS_ADMIN":        linux.CAP_SYS_ADMIN,
-	"CAP_SYS_BOOT":         linux.CAP_SYS_BOOT,
-	"CAP_SYS_NICE":         linux.CAP_SYS_NICE,
-	"CAP_SYS_RESOURCE":     linux.CAP_SYS_RESOURCE,
-	"CAP_SYS_TIME":         linux.CAP_SYS_TIME,
-	"CAP_SYS_TTY_CONFIG":   linux.CAP_SYS_TTY_CONFIG,
-	"CAP_MKNOD":            linux.CAP_MKNOD,
-	"CAP_LEASE":            linux.CAP_LEASE,
-	"CAP_AUDIT_WRITE":      linux.CAP_AUDIT_WRITE,
-	"CAP_AUDIT_CONTROL":    linux.CAP_AUDIT_CONTROL,
-	"CAP_SETFCAP":          linux.CAP_SETFCAP,
-	"CAP_MAC_OVERRIDE":     linux.CAP_MAC_OVERRIDE,
-	"CAP_MAC_ADMIN":        linux.CAP_MAC_ADMIN,
-	"CAP_SYSLOG":           linux.CAP_SYSLOG,
-	"CAP_WAKE_ALARM":       linux.CAP_WAKE_ALARM,
-	"CAP_BLOCK_SUSPEND":    linux.CAP_BLOCK_SUSPEND,
-	"CAP_AUDIT_READ":       linux.CAP_AUDIT_READ,
+	"CAP_CHOWN":              linux.CAP_CHOWN,
+	"CAP_DAC_OVERRIDE":       linux.CAP_DAC_OVERRIDE,
+	"CAP_DAC_READ_SEARCH":    linux.CAP_DAC_READ_SEARCH,
+	"CAP_FOWNER":             linux.CAP_FOWNER,
+	"CAP_FSETID":             linux.CAP_FSETID,
+	"CAP_KILL":               linux.CAP_KILL,
+	"CAP_SETGID":             linux.CAP_SETGID,
+	"CAP_SETUID":             linux.CAP_SETUID,
+	"CAP_SETPCAP":            linux.CAP_SETPCAP,
+	"CAP_LINUX_IMMUTABLE":    linux.CAP_LINUX_IMMUTABLE,
+	"CAP_NET_BIND_SERVICE":   linux.CAP_NET_BIND_SERVICE,
+	"CAP_NET_BROADCAST":      linux.CAP_NET_BROADCAST,
+	"CAP_NET_ADMIN":          linux.CAP_NET_ADMIN,
+	"CAP_NET_RAW":            linux.CAP_NET_RAW,
+	"CAP_IPC_LOCK":           linux.CAP_IPC_LOCK,
+	"CAP_IPC_OWNER":          linux.CAP_IPC_OWNER,
+	"CAP_SYS_MODULE":         linux.CAP_SYS_MODULE,
+	"CAP_SYS_RAWIO":          linux.CAP_SYS_RAWIO,
+	"CAP_SYS_CHROOT":         linux.CAP_SYS_CHROOT,
+	"CAP_SYS_PTRACE":         linux.CAP_SYS_PTRACE,
+	"CAP_SYS_PACCT":          linux.CAP_SYS_PACCT,
+	"CAP_SYS_ADMIN":          linux.CAP_SYS_ADMIN,
+	"CAP_SYS_BOOT":           linux.CAP_SYS_BOOT,
+	"CAP_SYS_NICE":           linux.CAP_SYS_NICE,
+	"CAP_SYS_RESOURCE":       linux.CAP_SYS_RESOURCE,
+	"CAP_SYS_TIME":           linux.CAP_SYS_TIME,
+	"CAP_SYS_TTY_CONFIG":     linux.CAP_SYS_TTY_CONFIG,
+	"CAP_MKNOD":              linux.CAP_MKNOD,
+	"CAP_LEASE":              linux.CAP_LEASE,
+	"CAP_AUDIT_WRITE":        linux.CAP_AUDIT_WRITE,
+	"CAP_AUDIT_CONTROL":      linux.CAP_AUDIT_CONTROL,
+	"CAP_SETFCAP":            linux.CAP_SETFCAP,
+	"CAP_MAC_OVERRIDE":       linux.CAP_MAC_OVERRIDE,
+	"CAP_MAC_ADMIN":          linux.CAP_MAC_ADMIN,
+	"CAP_SYSLOG":             linux.CAP_SYSLOG,
+	"CAP_WAKE_ALARM":         linux.CAP_WAKE_ALARM,
+	"CAP_BLOCK_SUSPEND":      linux.CAP_BLOCK_SUSPEND,
+	"CAP_AUDIT_READ":         linux.CAP_AUDIT_READ,
+	"CAP_PERFMON":            linux.CAP_PERFMON,
+	"CAP_BPF":                linux.CAP_BPF,
+	"CAP_CHECKPOINT_RESTORE": linux.CAP_CHECKPOINT_RESTORE,
 }
 
 func capsFromNames(names []string, skipSet map[linux.Capability]struct{}) (auth.CapabilitySet, error) {
@@ -335,9 +448,9 @@ func capsFromNames(names []string, skipSet map[linux.Capability]struct{}) (auth.
 
 // IsGoferMount returns true if the given mount can be mounted as an external
 // gofer.
-func IsGoferMount(m specs.Mount, vfs2Enabled bool) bool {
+func IsGoferMount(m specs.Mount) bool {
 	MaybeConvertToBindMount(&m)
-	return m.Type == "bind" && m.Source != "" && IsSupportedDevMount(m, vfs2Enabled)
+	return m.Type == "bind" && m.Source != ""
 }
 
 // MaybeConvertToBindMount converts mount type to "bind" in case any of the
@@ -355,29 +468,6 @@ func MaybeConvertToBindMount(m *specs.Mount) {
 			return
 		}
 	}
-}
-
-// IsSupportedDevMount returns true if m.Destination does not specify a
-// path that is hardcoded by VFS1's implementation of /dev.
-func IsSupportedDevMount(m specs.Mount, vfs2Enabled bool) bool {
-	// VFS2 has no hardcoded files under /dev, so everything is allowed.
-	if vfs2Enabled {
-		return true
-	}
-
-	// See pkg/sentry/fs/dev/dev.go.
-	var existingDevices = []string{
-		"/dev/fd", "/dev/stdin", "/dev/stdout", "/dev/stderr",
-		"/dev/null", "/dev/zero", "/dev/full", "/dev/random",
-		"/dev/urandom", "/dev/shm", "/dev/ptmx",
-	}
-	dst := filepath.Clean(m.Destination)
-	for _, dev := range existingDevices {
-		if dst == dev || strings.HasPrefix(dst, dev+"/") {
-			return false
-		}
-	}
-	return true
 }
 
 // WaitForReady waits for a process to become ready. The process is ready when
@@ -416,13 +506,13 @@ func WaitForReady(pid int, timeout time.Duration, ready func() (bool, error)) er
 // ends with '/', it's used as a directory with default file name.
 // 'logPattern' can contain variables that are substituted:
 //   - %TIMESTAMP%: is replaced with a timestamp using the following format:
-//			<yyyymmdd-hhmmss.uuuuuu>
-//	 - %COMMAND%: is replaced with 'command'
-//	 - %TEST%: is replaced with 'test' (omitted by default)
+//     <yyyymmdd-hhmmss.uuuuuu>
+//   - %COMMAND%: is replaced with 'command'
+//   - %TEST%: is replaced with 'test' (omitted by default)
 func DebugLogFile(logPattern, command, test string) (*os.File, error) {
 	if strings.HasSuffix(logPattern, "/") {
-		// Default format: <debug-log>/runsc.log.<yyyymmdd-hhmmss.uuuuuu>.<command>
-		logPattern += "runsc.log.%TIMESTAMP%.%COMMAND%"
+		// Default format: <debug-log>/runsc.log.<yyyymmdd-hhmmss.uuuuuu>.<command>.txt
+		logPattern += "runsc.log.%TIMESTAMP%.%COMMAND%.txt"
 	}
 	logPattern = strings.Replace(logPattern, "%TIMESTAMP%", time.Now().Format("20060102-150405.000000"), -1)
 	logPattern = strings.Replace(logPattern, "%COMMAND%", command, -1)
@@ -433,6 +523,28 @@ func DebugLogFile(logPattern, command, test string) (*os.File, error) {
 		return nil, fmt.Errorf("error creating dir %q: %v", dir, err)
 	}
 	return os.OpenFile(logPattern, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0664)
+}
+
+// IsDebugCommand returns true if the command should be debugged or not, based
+// on the current configuration.
+func IsDebugCommand(conf *config.Config, command string) bool {
+	if len(conf.DebugCommand) == 0 {
+		// Debug everything by default.
+		return true
+	}
+	filter := conf.DebugCommand
+	rv := true
+	if filter[0] == '!' {
+		// Negate the match, e.g. !boot should log all, but "boot".
+		filter = filter[1:]
+		rv = false
+	}
+	for _, cmd := range strings.Split(filter, ",") {
+		if cmd == command {
+			return rv
+		}
+	}
+	return !rv
 }
 
 // SafeSetupAndMount creates the mount point and calls Mount with the given
@@ -545,9 +657,15 @@ func GetOOMScoreAdj(pid int) (int, error) {
 	return strconv.Atoi(strings.TrimSpace(string(data)))
 }
 
-// EnvVar looks for a varible value in the env slice assuming the following
-// format: "NAME=VALUE".
+// EnvVar looks for a variable value in the env slice assuming the following
+// format: "NAME=VALUE". If a variable is defined multiple times, the last
+// value is used.
 func EnvVar(env []string, name string) (string, bool) {
+	var err error
+	env, err = ResolveEnvs(env)
+	if err != nil {
+		return "", false
+	}
 	prefix := name + "="
 	for _, e := range env {
 		if strings.HasPrefix(e, prefix) {

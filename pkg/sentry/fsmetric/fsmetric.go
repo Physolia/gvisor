@@ -12,11 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package fsmetric defines filesystem metrics that are used by both VFS1 and
-// VFS2.
-//
-// TODO(gvisor.dev/issue/1624): Once VFS1 is deleted, inline these metrics into
-// VFS2.
+// Package fsmetric defines filesystem metrics.
 package fsmetric
 
 import (
@@ -73,6 +69,7 @@ func StartReadWait() time.Time {
 // FinishReadWait is marked nosplit for performance since it's often called
 // from defer statements, which prevents it from being inlined
 // (https://github.com/golang/go/issues/38471).
+//
 //go:nosplit
 func FinishReadWait(m *metric.Uint64Metric, start time.Time) {
 	if !RecordWaitTime {

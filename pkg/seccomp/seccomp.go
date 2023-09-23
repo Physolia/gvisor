@@ -34,6 +34,13 @@ const (
 	defaultLabel = "default_action"
 )
 
+// NonNegativeFDCheck ensures an FD argument is a non-negative int.
+func NonNegativeFDCheck() LessThanOrEqual {
+	// Negative int32 has the MSB (31st bit) set. So the raw uint FD value must
+	// be less than or equal to 0x7fffffff.
+	return LessThanOrEqual(0x7fffffff)
+}
+
 // Install generates BPF code based on the set of syscalls provided. It only
 // allows syscalls that conform to the specification. Syscalls that violate the
 // specification will trigger RET_KILL_PROCESS. If RET_KILL_PROCESS is not
@@ -54,7 +61,9 @@ func Install(rules SyscallRules, denyRules SyscallRules) error {
 		return err
 	}
 
-	// Uncomment to get stack trace when there is a violation.
+	// ***   DEBUG TIP   ***
+	// If you suspect the process is getting killed due to a seccomp violation, uncomment the line
+	// below to get a panic stack trace when there is a violation.
 	// defaultAction = linux.BPFAction(linux.SECCOMP_RET_TRAP)
 
 	log.Infof("Installing seccomp filters for %d syscalls (action=%v)", len(rules), defaultAction)
@@ -407,19 +416,22 @@ func addSyscallArgsCheck(p *bpf.ProgramBuilder, rules []Rule, action linux.BPFAc
 // is as follows:
 //
 // // SYS_PIPE(22), root
-//   (A == 22) ? goto argument check : continue
-//   (A > 22) ? goto index_35 : goto index_9
+//
+//	(A == 22) ? goto argument check : continue
+//	(A > 22) ? goto index_35 : goto index_9
 //
 // index_9:  // SYS_MMAP(9), leaf
-//   A == 9) ? goto argument check : defaultLabel
+//
+//	A == 9) ? goto argument check : defaultLabel
 //
 // index_35:  // SYS_NANOSLEEP(35), single child
-//   (A == 35) ? goto argument check : continue
-//   (A > 35) ? goto index_50 : goto defaultLabel
+//
+//	(A == 35) ? goto argument check : continue
+//	(A > 35) ? goto index_50 : goto defaultLabel
 //
 // index_50:  // SYS_LISTEN(50), leaf
-//   (A == 50) ? goto argument check : goto defaultLabel
 //
+//	(A == 50) ? goto argument check : goto defaultLabel
 func buildBSTProgram(n *node, rules []RuleSet, program *bpf.ProgramBuilder) error {
 	// Root node is never referenced by label, skip it.
 	if !n.root {

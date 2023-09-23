@@ -15,18 +15,17 @@
 package gofer
 
 import (
-	"sync/atomic"
-
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
-func dentryTimestampFromP9(s, ns uint64) int64 {
-	return int64(s*1e9 + ns)
+func dentryTimestamp(t linux.StatxTimestamp) int64 {
+	return t.ToNsec()
 }
 
-func dentryTimestampFromLisa(t linux.StatxTimestamp) int64 {
-	return t.Sec*1e9 + int64(t.Nsec)
+func dentryTimestampFromUnix(t unix.Timespec) int64 {
+	return dentryTimestamp(linux.StatxTimestamp{Sec: t.Sec, Nsec: uint32(t.Nsec)})
 }
 
 // Preconditions: d.cachedMetadataAuthoritative() == true.
@@ -40,7 +39,7 @@ func (d *dentry) touchAtime(mnt *vfs.Mount) {
 	now := d.fs.clock.Now().Nanoseconds()
 	d.metadataMu.Lock()
 	d.atime.Store(now)
-	atomic.StoreUint32(&d.atimeDirty, 1)
+	d.atimeDirty.Store(1)
 	d.metadataMu.Unlock()
 	mnt.EndWrite()
 }
@@ -55,13 +54,13 @@ func (d *dentry) touchAtimeLocked(mnt *vfs.Mount) {
 	}
 	now := d.fs.clock.Now().Nanoseconds()
 	d.atime.Store(now)
-	atomic.StoreUint32(&d.atimeDirty, 1)
+	d.atimeDirty.Store(1)
 	mnt.EndWrite()
 }
 
 // Preconditions:
-// * d.cachedMetadataAuthoritative() == true.
-// * The caller has successfully called vfs.Mount.CheckBeginWrite().
+//   - d.cachedMetadataAuthoritative() == true.
+//   - The caller has successfully called vfs.Mount.CheckBeginWrite().
 func (d *dentry) touchCtime() {
 	now := d.fs.clock.Now().Nanoseconds()
 	d.metadataMu.Lock()
@@ -70,23 +69,23 @@ func (d *dentry) touchCtime() {
 }
 
 // Preconditions:
-// * d.cachedMetadataAuthoritative() == true.
-// * The caller has successfully called vfs.Mount.CheckBeginWrite().
+//   - d.cachedMetadataAuthoritative() == true.
+//   - The caller has successfully called vfs.Mount.CheckBeginWrite().
 func (d *dentry) touchCMtime() {
 	now := d.fs.clock.Now().Nanoseconds()
 	d.metadataMu.Lock()
 	d.mtime.Store(now)
 	d.ctime.Store(now)
-	atomic.StoreUint32(&d.mtimeDirty, 1)
+	d.mtimeDirty.Store(1)
 	d.metadataMu.Unlock()
 }
 
 // Preconditions:
-// * d.cachedMetadataAuthoritative() == true.
-// * The caller has locked d.metadataMu.
+//   - d.cachedMetadataAuthoritative() == true.
+//   - The caller has locked d.metadataMu.
 func (d *dentry) touchCMtimeLocked() {
 	now := d.fs.clock.Now().Nanoseconds()
 	d.mtime.Store(now)
 	d.ctime.Store(now)
-	atomic.StoreUint32(&d.mtimeDirty, 1)
+	d.mtimeDirty.Store(1)
 }

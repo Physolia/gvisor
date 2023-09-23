@@ -101,6 +101,7 @@ var SocketFlagSet = abi.FlagSet{
 var ipProtocol = abi.ValueSet{
 	linux.IPPROTO_IP:      "IPPROTO_IP",
 	linux.IPPROTO_ICMP:    "IPPROTO_ICMP",
+	linux.IPPROTO_ICMPV6:  "IPPROTO_ICMPV6",
 	linux.IPPROTO_IGMP:    "IPPROTO_IGMP",
 	linux.IPPROTO_IPIP:    "IPPROTO_IPIP",
 	linux.IPPROTO_TCP:     "IPPROTO_TCP",
@@ -351,7 +352,7 @@ func sockAddr(t *kernel.Task, addr hostarch.Addr, length uint32) string {
 		}
 
 		if family == linux.AF_UNIX {
-			return fmt.Sprintf("%#x {Family: %s, Addr: %q}", addr, familyStr, string(fa.Addr))
+			return fmt.Sprintf("%#x {Family: %s, Addr: %q}", addr, familyStr, string(fa.Addr.AsSlice()))
 		}
 
 		return fmt.Sprintf("%#x {Family: %s, Addr: %v, Port: %d}", addr, familyStr, fa.Addr, fa.Port)
@@ -462,7 +463,7 @@ func sockOptVal(t *kernel.Task, level, optname uint64, optVal hostarch.Addr, opt
 		}
 		return fmt.Sprintf("%#x {value=%v}", optVal, v)
 	default:
-		return dump(t, optVal, uint(optLen), maximumBlobSize)
+		return dump(t, optVal, uint(optLen), maximumBlobSize, true /* content */)
 	}
 }
 
@@ -544,6 +545,7 @@ var sockOptNames = map[uint64]abi.ValueSet{
 		linux.SO_RCVTIMEO:     "SO_RCVTIMEO",
 		linux.SO_OOBINLINE:    "SO_OOBINLINE",
 		linux.SO_TIMESTAMP:    "SO_TIMESTAMP",
+		linux.SO_ACCEPTCONN:   "SO_ACCEPTCONN",
 	},
 	linux.SOL_TCP: {
 		linux.TCP_NODELAY:              "TCP_NODELAY",

@@ -58,6 +58,14 @@ type Platform interface {
 	// is supported.
 	HaveGlobalMemoryBarrier() bool
 
+	// OwnsPageTables returns true if the Platform implementation manages any
+	// page tables directly (rather than via host mmap(2) etc.) As of this
+	// writing, this property is relevant because the AddressSpace interface
+	// does not support specification of memory type (cacheability), such that
+	// host FDs specifying memory types (e.g. device drivers) can only set them
+	// correctly in host-managed page tables.
+	OwnsPageTables() bool
+
 	// MapUnit returns the alignment used for optional mappings into this
 	// platform's AddressSpaces. Higher values indicate lower per-page costs
 	// for AddressSpace.MapFile. As a special case, a MapUnit of 0 indicates
@@ -89,7 +97,7 @@ type Platform interface {
 	//
 	// In general, this blocking behavior only occurs when
 	// CooperativelySchedulesAddressSpace (above) returns false.
-	NewAddressSpace(mappingsID interface{}) (AddressSpace, <-chan struct{}, error)
+	NewAddressSpace(mappingsID any) (AddressSpace, <-chan struct{}, error)
 
 	// NewContext returns a new execution context.
 	NewContext(context.Context) Context
@@ -167,6 +175,22 @@ func (UseHostProcessMemoryBarrier) GlobalMemoryBarrier() error {
 	return hostmm.GlobalMemoryBarrier()
 }
 
+// DoesOwnPageTables implements Platform.OwnsPageTables in the positive.
+type DoesOwnPageTables struct{}
+
+// OwnsPageTables implements Platform.OwnsPageTables.
+func (DoesOwnPageTables) OwnsPageTables() bool {
+	return true
+}
+
+// DoesNotOwnPageTables implements Platform.OwnsPageTables in the negative.
+type DoesNotOwnPageTables struct{}
+
+// OwnsPageTables implements Platform.OwnsPageTables.
+func (DoesNotOwnPageTables) OwnsPageTables() bool {
+	return false
+}
+
 // MemoryManager represents an abstraction above the platform address space
 // which manages memory mappings and their contents.
 type MemoryManager interface {
@@ -176,11 +200,13 @@ type MemoryManager interface {
 	MMap(ctx context.Context, opts memmap.MMapOpts) (hostarch.Addr, error)
 	// AddressSpace returns the AddressSpace bound to mm.
 	AddressSpace() AddressSpace
+	// FindVMAByName finds a vma with the specified name.
+	FindVMAByName(ar hostarch.AddrRange, hint string) (hostarch.Addr, uint64, error)
 }
 
 // Context represents the execution context for a single thread.
 type Context interface {
-	// Switch resumes execution of the thread specified by the arch.Context
+	// Switch resumes execution of the thread specified by the arch.Context64
 	// in the provided address space. This call will block while the thread
 	// is executing.
 	//
@@ -192,22 +218,22 @@ type Context interface {
 	//
 	// Switch may return one of the following special errors:
 	//
-	// - nil: The Context invoked a system call.
+	//	- nil: The Context invoked a system call.
 	//
-	// - ErrContextSignal: The Context was interrupted by a signal. The
-	// returned *linux.SignalInfo contains information about the signal. If
-	// linux.SignalInfo.Signo == SIGSEGV, the returned hostarch.AccessType
-	// contains the access type of the triggering fault. The caller owns
-	// the returned SignalInfo.
+	//	- ErrContextSignal: The Context was interrupted by a signal. The
+	//		returned *linux.SignalInfo contains information about the signal. If
+	//		linux.SignalInfo.Signo == SIGSEGV, the returned hostarch.AccessType
+	//		contains the access type of the triggering fault. The caller owns
+	//		the returned SignalInfo.
 	//
-	// - ErrContextInterrupt: The Context was interrupted by a call to
-	// Interrupt(). Switch() may return ErrContextInterrupt spuriously. In
-	// particular, most implementations of Interrupt() will cause the first
-	// following call to Switch() to return ErrContextInterrupt if there is no
-	// concurrent call to Switch().
+	//	- ErrContextInterrupt: The Context was interrupted by a call to
+	//		Interrupt(). Switch() may return ErrContextInterrupt spuriously. In
+	//		particular, most implementations of Interrupt() will cause the first
+	//		following call to Switch() to return ErrContextInterrupt if there is no
+	//		concurrent call to Switch().
 	//
-	// - ErrContextCPUPreempted: See the definition of that error for details.
-	Switch(ctx context.Context, mm MemoryManager, ac arch.Context, cpu int32) (*linux.SignalInfo, hostarch.AccessType, error)
+	//	- ErrContextCPUPreempted: See the definition of that error for details.
+	Switch(ctx context.Context, mm MemoryManager, ac *arch.Context64, cpu int32) (*linux.SignalInfo, hostarch.AccessType, error)
 
 	// PullFullState() pulls a full state of the application thread.
 	//
@@ -221,7 +247,7 @@ type Context interface {
 	// PullFullState() to load all registers and FPU state.
 	//
 	// Preconditions: The caller must be running on the task goroutine.
-	PullFullState(as AddressSpace, ac arch.Context)
+	PullFullState(as AddressSpace, ac *arch.Context64) error
 
 	// FullStateChanged() indicates that a thread state has been changed by
 	// the Sentry. This happens in case of the rt_sigreturn, execve, etc.
@@ -244,6 +270,10 @@ type Context interface {
 
 	// Release() releases any resources associated with this context.
 	Release()
+
+	// PrepareSleep() is called when the tread switches to the
+	// interruptible sleep state.
+	PrepareSleep()
 }
 
 var (
@@ -258,15 +288,15 @@ var (
 	// ErrContextCPUPreempted is returned by Context.Switch() to indicate that
 	// one of the following occurred:
 	//
-	// - The CPU executing the Context is not the CPU passed to
-	// Context.Switch().
+	//	- The CPU executing the Context is not the CPU passed to
+	//		Context.Switch().
 	//
-	// - The CPU executing the Context may have executed another Context since
-	// the last time it executed this one; or the CPU has previously executed
-	// another Context, and has never executed this one.
+	//	- The CPU executing the Context may have executed another Context since
+	//		the last time it executed this one; or the CPU has previously executed
+	//		another Context, and has never executed this one.
 	//
-	// - Platform.PreemptAllCPUs() was called since the last return from
-	// Context.Switch().
+	//	- Platform.PreemptAllCPUs() was called since the last return from
+	//		Context.Switch().
 	ErrContextCPUPreempted = fmt.Errorf("interrupted by CPU preemption")
 )
 
@@ -291,18 +321,18 @@ type AddressSpace interface {
 	// implementations may choose to ignore it.
 	//
 	// Preconditions:
-	// * addr and fr must be page-aligned.
-	// * fr.Length() > 0.
-	// * at.Any() == true.
-	// * At least one reference must be held on all pages in fr, and must
-	//   continue to be held as long as pages are mapped.
+	//	* addr and fr must be page-aligned.
+	//	* fr.Length() > 0.
+	//	* at.Any() == true.
+	//	* At least one reference must be held on all pages in fr, and must
+	//		continue to be held as long as pages are mapped.
 	MapFile(addr hostarch.Addr, f memmap.File, fr memmap.FileRange, at hostarch.AccessType, precommit bool) error
 
 	// Unmap unmaps the given range.
 	//
 	// Preconditions:
-	// * addr is page-aligned.
-	// * length > 0.
+	//	* addr is page-aligned.
+	//	* length > 0.
 	Unmap(addr hostarch.Addr, length uint64)
 
 	// Release releases this address space. After releasing, a new AddressSpace
@@ -424,7 +454,7 @@ type Constructor interface {
 	//
 	// Arguments:
 	//
-	// * deviceFile - the device file (e.g. /dev/kvm for the KVM platform).
+	//	* deviceFile - the device file (e.g. /dev/kvm for the KVM platform).
 	New(deviceFile *os.File) (Platform, error)
 
 	// OpenDevice opens the path to the device used by the platform.
@@ -446,7 +476,7 @@ func Register(name string, platform Constructor) {
 
 // List lists available platforms.
 func List() (available []string) {
-	for name, _ := range platforms {
+	for name := range platforms {
 		available = append(available, name)
 	}
 	return

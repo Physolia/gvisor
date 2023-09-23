@@ -48,12 +48,12 @@
 //
 // Lock order:
 //
-// kernel.CgroupRegistry.mu
-//   kernfs.filesystem.mu
-//   kernel.TaskSet.mu
-//     kernel.Task.mu
-//       cgroupfs.filesystem.tasksMu.
-//         cgroupfs.dir.OrderedChildren.mu
+//	kernel.CgroupRegistry.mu
+//		kernfs.filesystem.mu
+//		kernel.TaskSet.mu
+//	  	kernel.Task.mu
+//	    	cgroupfs.filesystem.tasksMu.
+//	      	cgroupfs.dir.OrderedChildren.mu
 package cgroupfs
 
 import (
@@ -72,7 +72,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
-	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
@@ -86,29 +85,46 @@ const (
 	defaultMaxCachedDentries = uint64(1000)
 )
 
-const (
-	controllerCPU     = kernel.CgroupControllerType("cpu")
-	controllerCPUAcct = kernel.CgroupControllerType("cpuacct")
-	controllerCPUSet  = kernel.CgroupControllerType("cpuset")
-	controllerJob     = kernel.CgroupControllerType("job")
-	controllerMemory  = kernel.CgroupControllerType("memory")
-)
-
 var allControllers = []kernel.CgroupControllerType{
-	controllerCPU,
-	controllerCPUAcct,
-	controllerCPUSet,
-	controllerJob,
-	controllerMemory,
+	kernel.CgroupControllerCPU,
+	kernel.CgroupControllerCPUAcct,
+	kernel.CgroupControllerCPUSet,
+	kernel.CgroupControllerDevices,
+	kernel.CgroupControllerJob,
+	kernel.CgroupControllerMemory,
+	kernel.CgroupControllerPIDs,
 }
 
 // SupportedMountOptions is the set of supported mount options for cgroupfs.
-var SupportedMountOptions = []string{"all", "cpu", "cpuacct", "cpuset", "job", "memory"}
+var SupportedMountOptions = []string{"all", "cpu", "cpuacct", "cpuset", "devices", "job", "memory", "pids"}
 
 // FilesystemType implements vfs.FilesystemType.
 //
 // +stateify savable
 type FilesystemType struct{}
+
+// InitialCgroup specifies properties of the cgroup for the init task.
+//
+// +stateify savable
+type InitialCgroup struct {
+	// Path is an absolute path relative to the root of a cgroupfs filesystem
+	// that indicates where to place the init task. An empty string indicates
+	// the root of the filesystem.
+	Path string
+
+	// SetOwner indicates the UID and GID fields contain valid values. If true,
+	// Both UID and GID must be provided.
+	SetOwner bool
+	// UID of the initial cgroup path components, excluding the root cgroup.
+	UID auth.KUID
+	// GID of the initial cgroup path components, excluding the root cgroup.
+	GID auth.KGID
+
+	// SetMode indicates the Mode field contains a valid value.
+	SetMode bool
+	// Mode of the initial cgroup path components, excluding the root cgroup.
+	Mode linux.FileMode
+}
 
 // InternalData contains internal data passed in to the cgroupfs mount via
 // vfs.GetFilesystemOptions.InternalData.
@@ -116,7 +132,7 @@ type FilesystemType struct{}
 // +stateify savable
 type InternalData struct {
 	DefaultControlValues map[string]int64
-	InitialCgroupPath    string
+	InitialCgroup        InitialCgroup
 }
 
 // filesystem implements vfs.FilesystemImpl and kernel.cgroupFS.
@@ -132,6 +148,12 @@ type filesystem struct {
 	//
 	// hierarchyID is immutable after initialization.
 	hierarchyID uint32
+
+	// hierarchyName is the name for a named hierarchy. May be empty if the
+	// 'name=' mount option was not used when the hierarchy was created.
+	//
+	// Immutable after initialization.
+	hierarchyName string
 
 	// controllers and kcontrollers are both the list of controllers attached to
 	// this cgroupfs. Both lists are the same set of controllers, but typecast
@@ -151,12 +173,20 @@ type filesystem struct {
 
 	// tasksMu serializes task membership changes across all cgroups within a
 	// filesystem.
-	tasksMu sync.RWMutex `state:"nosave"`
+	tasksMu taskRWMutex `state:"nosave"`
 }
 
 // InitializeHierarchyID implements kernel.cgroupFS.InitializeHierarchyID.
 func (fs *filesystem) InitializeHierarchyID(hid uint32) {
 	fs.hierarchyID = hid
+}
+
+// RootCgroup implements kernel.cgroupFS.RootCgroup.
+func (fs *filesystem) RootCgroup() kernel.Cgroup {
+	return kernel.Cgroup{
+		Dentry:     fs.root,
+		CgroupImpl: fs.root.Inode().(kernel.CgroupImpl),
+	}
 }
 
 // Name implements vfs.FilesystemType.Name.
@@ -188,23 +218,31 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	var wantControllers []kernel.CgroupControllerType
 	if _, ok := mopts["cpu"]; ok {
 		delete(mopts, "cpu")
-		wantControllers = append(wantControllers, controllerCPU)
+		wantControllers = append(wantControllers, kernel.CgroupControllerCPU)
 	}
 	if _, ok := mopts["cpuacct"]; ok {
 		delete(mopts, "cpuacct")
-		wantControllers = append(wantControllers, controllerCPUAcct)
+		wantControllers = append(wantControllers, kernel.CgroupControllerCPUAcct)
 	}
 	if _, ok := mopts["cpuset"]; ok {
 		delete(mopts, "cpuset")
-		wantControllers = append(wantControllers, controllerCPUSet)
+		wantControllers = append(wantControllers, kernel.CgroupControllerCPUSet)
+	}
+	if _, ok := mopts["devices"]; ok {
+		delete(mopts, "devices")
+		wantControllers = append(wantControllers, kernel.CgroupControllerDevices)
 	}
 	if _, ok := mopts["job"]; ok {
 		delete(mopts, "job")
-		wantControllers = append(wantControllers, controllerJob)
+		wantControllers = append(wantControllers, kernel.CgroupControllerJob)
 	}
 	if _, ok := mopts["memory"]; ok {
 		delete(mopts, "memory")
-		wantControllers = append(wantControllers, controllerMemory)
+		wantControllers = append(wantControllers, kernel.CgroupControllerMemory)
+	}
+	if _, ok := mopts["pids"]; ok {
+		delete(mopts, "pids")
+		wantControllers = append(wantControllers, kernel.CgroupControllerPIDs)
 	}
 	if _, ok := mopts["all"]; ok {
 		if len(wantControllers) > 0 {
@@ -216,9 +254,37 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		wantControllers = allControllers
 	}
 
-	if len(wantControllers) == 0 {
-		// Specifying no controllers implies all controllers.
+	var name string
+	var ok bool
+	if name, ok = mopts["name"]; ok {
+		delete(mopts, "name")
+	}
+
+	var none bool
+	if _, ok = mopts["none"]; ok {
+		none = true
+		delete(mopts, "none")
+	}
+
+	if !none && len(wantControllers) == 0 {
+		// Specifying no controllers implies all controllers, unless "none" was
+		// explicitly requested.
 		wantControllers = allControllers
+	}
+
+	// Some combinations of "none", "all", "name=" and explicit controllers are
+	// not allowed. See Linux, kernel/cgroup.c:parse_cgroupfs_options().
+
+	// All empty hierarchies must have a name.
+	if len(wantControllers) == 0 && name == "" {
+		ctx.Debugf("cgroupfs.FilesystemType.GetFilesystem: empty hierarchy with no name")
+		return nil, nil, linuxerr.EINVAL
+	}
+
+	// Can't have "none" and some controllers.
+	if none && len(wantControllers) != 0 {
+		ctx.Debugf("cgroupfs.FilesystemType.GetFilesystem: 'none' specified with controllers: %v", wantControllers)
+		return nil, nil, linuxerr.EINVAL
 	}
 
 	if len(mopts) != 0 {
@@ -239,7 +305,11 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	//
 	// Note: we're guaranteed to have at least one requested controller, since
 	// no explicit controller name implies all controllers.
-	if vfsfs := r.FindHierarchy(wantControllers); vfsfs != nil {
+	vfsfs, err := r.FindHierarchy(name, wantControllers)
+	if err != nil {
+		return nil, nil, err
+	}
+	if vfsfs != nil {
 		fs := vfsfs.Impl().(*filesystem)
 		ctx.Debugf("cgroupfs.FilesystemType.GetFilesystem: mounting new view to hierarchy %v", fs.hierarchyID)
 		fs.root.IncRef()
@@ -255,7 +325,8 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	// hierarchies. We'll find out about such collisions when we try to register
 	// the new hierarchy later.
 	fs := &filesystem{
-		devMinor: devMinor,
+		devMinor:      devMinor,
+		hierarchyName: name,
 	}
 	fs.MaxCachedDentries = maxCachedDentries
 	fs.VFSFilesystem().Init(vfsObj, &fsType, fs)
@@ -269,16 +340,20 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	for _, ty := range wantControllers {
 		var c controller
 		switch ty {
-		case controllerCPU:
+		case kernel.CgroupControllerCPU:
 			c = newCPUController(fs, defaults)
-		case controllerCPUAcct:
+		case kernel.CgroupControllerCPUAcct:
 			c = newCPUAcctController(fs)
-		case controllerCPUSet:
+		case kernel.CgroupControllerCPUSet:
 			c = newCPUSetController(k, fs)
-		case controllerJob:
+		case kernel.CgroupControllerDevices:
+			c = newDevicesController(fs)
+		case kernel.CgroupControllerJob:
 			c = newJobController(fs)
-		case controllerMemory:
+		case kernel.CgroupControllerMemory:
 			c = newMemoryController(fs, defaults)
+		case kernel.CgroupControllerPIDs:
+			c = newRootPIDsController(fs)
 		default:
 			panic(fmt.Sprintf("Unreachable: unknown cgroup controller %q", ty))
 		}
@@ -315,7 +390,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	// Register controllers. The registry may be modified concurrently, so if we
 	// get an error, we raced with someone else who registered the same
 	// controllers first.
-	if err := r.Register(fs.kcontrollers, fs); err != nil {
+	if err := r.Register(name, fs.kcontrollers, fs); err != nil {
 		ctx.Infof("cgroupfs.FilesystemType.GetFilesystem: failed to register new hierarchy with controllers %v: %v", wantControllers, err)
 		rootD.DecRef(ctx)
 		fs.VFSFilesystem().DecRef(ctx)
@@ -323,7 +398,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	}
 
 	// Move all existing tasks to the root of the new hierarchy.
-	k.PopulateNewCgroupHierarchy(fs.rootCgroup())
+	k.PopulateNewCgroupHierarchy(fs.effectiveRootCgroup())
 
 	return fs.VFSFilesystem(), rootD.VFSDentry(), nil
 }
@@ -334,21 +409,37 @@ func (fs *filesystem) prepareInitialCgroup(ctx context.Context, vfsObj *vfs.Virt
 	if opts.InternalData == nil {
 		return nil
 	}
-	initPathStr := opts.InternalData.(*InternalData).InitialCgroupPath
+	idata := opts.InternalData.(*InternalData)
+
+	initPathStr := idata.InitialCgroup.Path
 	if initPathStr == "" {
 		return nil
 	}
 	ctx.Debugf("cgroupfs.FilesystemType.GetFilesystem: initial cgroup path: %v", initPathStr)
 	initPath := fspath.Parse(initPathStr)
-	if !initPath.Absolute || !initPath.HasComponents() {
+	if !initPath.Absolute {
 		ctx.Warningf("cgroupfs.FilesystemType.GetFilesystem: initial cgroup path invalid: %+v", initPath)
 		return linuxerr.EINVAL
+	}
+	if !initPath.HasComponents() {
+		// Explicit "/" as initial cgroup, nothing to do.
+		return nil
+	}
+
+	ownerCreds := auth.CredentialsFromContext(ctx).Fork()
+	if idata.InitialCgroup.SetOwner {
+		ownerCreds.EffectiveKUID = idata.InitialCgroup.UID
+		ownerCreds.EffectiveKGID = idata.InitialCgroup.GID
+	}
+	mode := defaultDirMode
+	if idata.InitialCgroup.SetMode {
+		mode = idata.InitialCgroup.Mode
 	}
 
 	// Have initial cgroup target, create the tree.
 	cgDir := fs.root.Inode().(*cgroupInode)
 	for pit := initPath.Begin; pit.Ok(); pit = pit.Next() {
-		cgDirI, err := cgDir.NewDir(ctx, pit.String(), vfs.MkdirOptions{Mode: defaultDirMode})
+		cgDirI, err := cgDir.newDirWithOwner(ctx, ownerCreds, pit.String(), vfs.MkdirOptions{Mode: mode})
 		if err != nil {
 			return err
 		}
@@ -365,7 +456,7 @@ func (fs *filesystem) prepareInitialCgroup(ctx context.Context, vfsObj *vfs.Virt
 	return nil
 }
 
-func (fs *filesystem) rootCgroup() kernel.Cgroup {
+func (fs *filesystem) effectiveRootCgroup() kernel.Cgroup {
 	return kernel.Cgroup{
 		Dentry:     fs.effectiveRoot,
 		CgroupImpl: fs.effectiveRoot.Inode().(kernel.CgroupImpl),
@@ -412,11 +503,13 @@ func (*implStatFS) StatFS(context.Context, *vfs.Filesystem) (linux.Statfs, error
 //
 // +stateify savable
 type dir struct {
-	kernfs.InodeNoopRefCount
 	kernfs.InodeAlwaysValid
 	kernfs.InodeAttrs
-	kernfs.InodeNotSymlink
 	kernfs.InodeDirectoryNoNewChildren
+	kernfs.InodeNoopRefCount
+	kernfs.InodeNotAnonymous
+	kernfs.InodeNotSymlink
+	kernfs.InodeWatches
 	kernfs.OrderedChildren
 	implStatFS
 
@@ -438,6 +531,8 @@ func (d *dir) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Crede
 
 // Open implements kernfs.Inode.Open.
 func (d *dir) Open(ctx context.Context, rp *vfs.ResolvingPath, kd *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+	opts.Flags &= linux.O_ACCMODE | linux.O_CREAT | linux.O_EXCL | linux.O_TRUNC |
+		linux.O_DIRECTORY | linux.O_NOFOLLOW | linux.O_NONBLOCK | linux.O_NOCTTY
 	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), kd, &d.OrderedChildren, &d.locks, &opts, kernfs.GenericDirectoryFDOptions{
 		SeekEnd: kernfs.SeekEndStaticEntries,
 	})
@@ -449,6 +544,10 @@ func (d *dir) Open(ctx context.Context, rp *vfs.ResolvingPath, kd *kernfs.Dentry
 
 // NewDir implements kernfs.Inode.NewDir.
 func (d *dir) NewDir(ctx context.Context, name string, opts vfs.MkdirOptions) (kernfs.Inode, error) {
+	return d.newDirWithOwner(ctx, auth.CredentialsFromContext(ctx), name, opts)
+}
+
+func (d *dir) newDirWithOwner(ctx context.Context, ownerCreds *auth.Credentials, name string, opts vfs.MkdirOptions) (kernfs.Inode, error) {
 	// "Do not accept '\n' to prevent making /proc/<pid>/cgroup unparsable."
 	//   -- Linux, kernel/cgroup.c:cgroup_mkdir().
 	if strings.Contains(name, "\n") {
@@ -457,7 +556,7 @@ func (d *dir) NewDir(ctx context.Context, name string, opts vfs.MkdirOptions) (k
 	mode := opts.Mode.Permissions() | linux.ModeDirectory
 	return d.OrderedChildren.Inserter(name, func() kernfs.Inode {
 		d.IncLinks(1)
-		return d.fs.newCgroupInode(ctx, auth.CredentialsFromContext(ctx), d.cgi, mode)
+		return d.fs.newCgroupInode(ctx, ownerCreds, d.cgi, mode)
 	})
 }
 
@@ -552,12 +651,60 @@ func (d *dir) forEachChildDir(fn func(*dir)) {
 	})
 }
 
+// controllerFileImpl represents common cgroupfs-specific operations for control
+// files.
+type controllerFileImpl interface {
+	// Source extracts the underlying DynamicBytesFile for a control file.
+	Source() *kernfs.DynamicBytesFile
+	// AllowBackgroundAccess indicates whether a control file can be accessed
+	// from a background (i.e. non-task) context. Some control files cannot be
+	// meaningfully accessed from a non-task context because accessing them
+	// either have side effects on the calling context (ex: task migration
+	// across cgroups), or they refer to data which must be interpreted within
+	// the calling context (ex: when referring to a pid, in which pid
+	// namespace?).
+	//
+	// Currently, all writable control files that allow access from a background
+	// process can handle a nil FD, since a background write doesn't explicitly
+	// open the control file. This is enforced through the
+	// writableControllerFileImpl.
+	AllowBackgroundAccess() bool
+}
+
+// writableControllerFileImpl represents common cgroupfs-specific operations for
+// a writable control file.
+type writableControllerFileImpl interface {
+	controllerFileImpl
+	// WriteBackground writes data to a control file from a background
+	// context. This means the write isn't performed through and FD may be
+	// performed from a background context.
+	//
+	// Control files that support this should also return true for
+	// controllerFileImpl.AllowBackgroundAccess().
+	WriteBackground(ctx context.Context, src usermem.IOSequence) (int64, error)
+}
+
 // controllerFile represents a generic control file that appears within a cgroup
 // directory.
 //
 // +stateify savable
 type controllerFile struct {
 	kernfs.DynamicBytesFile
+	implStatFS
+
+	allowBackgroundAccess bool
+}
+
+var _ controllerFileImpl = (*controllerFile)(nil)
+
+// Source implements controllerFileImpl.Source.
+func (f *controllerFile) Source() *kernfs.DynamicBytesFile {
+	return &f.DynamicBytesFile
+}
+
+// AllowBackgroundAccess implements controllerFileImpl.AllowBackgroundAccess.
+func (f *controllerFile) AllowBackgroundAccess() bool {
+	return f.allowBackgroundAccess
 }
 
 // SetStat implements kernfs.Inode.SetStat.
@@ -565,14 +712,18 @@ func (f *controllerFile) SetStat(ctx context.Context, fs *vfs.Filesystem, creds 
 	return f.InodeAttrs.SetStat(ctx, fs, creds, opts)
 }
 
-func (fs *filesystem) newControllerFile(ctx context.Context, creds *auth.Credentials, data vfs.DynamicBytesSource) kernfs.Inode {
-	f := &controllerFile{}
+func (fs *filesystem) newControllerFile(ctx context.Context, creds *auth.Credentials, data vfs.DynamicBytesSource, allowBackgroundAccess bool) kernfs.Inode {
+	f := &controllerFile{
+		allowBackgroundAccess: allowBackgroundAccess,
+	}
 	f.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), data, readonlyFileMode)
 	return f
 }
 
-func (fs *filesystem) newControllerWritableFile(ctx context.Context, creds *auth.Credentials, data vfs.WritableDynamicBytesSource) kernfs.Inode {
-	f := &controllerFile{}
+func (fs *filesystem) newControllerWritableFile(ctx context.Context, creds *auth.Credentials, data vfs.WritableDynamicBytesSource, allowBackgroundAccess bool) kernfs.Inode {
+	f := &controllerFile{
+		allowBackgroundAccess: allowBackgroundAccess,
+	}
 	f.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), data, writableFileMode)
 	return f
 }
@@ -585,6 +736,18 @@ func (fs *filesystem) newControllerWritableFile(ctx context.Context, creds *auth
 type staticControllerFile struct {
 	kernfs.DynamicBytesFile
 	vfs.StaticData
+}
+
+var _ controllerFileImpl = (*staticControllerFile)(nil)
+
+// Source implements controllerFileImpl.Source.
+func (f *staticControllerFile) Source() *kernfs.DynamicBytesFile {
+	return &f.DynamicBytesFile
+}
+
+// AllowBackgroundAccess implements controllerFileImpl.AllowBackgroundAccess.
+func (f *staticControllerFile) AllowBackgroundAccess() bool {
+	return true
 }
 
 // SetStat implements kernfs.Inode.SetStat.
@@ -613,6 +776,8 @@ type stubControllerFile struct {
 	data *atomicbitops.Int64
 }
 
+var _ controllerFileImpl = (*stubControllerFile)(nil)
+
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (f *stubControllerFile) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	fmt.Fprintf(buf, "%d\n", f.data.Load())
@@ -621,6 +786,11 @@ func (f *stubControllerFile) Generate(ctx context.Context, buf *bytes.Buffer) er
 
 // Write implements vfs.WritableDynamicBytesSource.Write.
 func (f *stubControllerFile) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
+	return f.WriteBackground(ctx, src)
+}
+
+// WriteBackground implements writableControllerFileImpl.WriteBackground.
+func (f *stubControllerFile) WriteBackground(ctx context.Context, src usermem.IOSequence) (int64, error) {
 	val, n, err := parseInt64FromString(ctx, src)
 	if err != nil {
 		return 0, err
@@ -631,8 +801,11 @@ func (f *stubControllerFile) Write(ctx context.Context, _ *vfs.FileDescription, 
 
 // newStubControllerFile creates a new stub controller file that loads and
 // stores a control value from data.
-func (fs *filesystem) newStubControllerFile(ctx context.Context, creds *auth.Credentials, data *atomicbitops.Int64) kernfs.Inode {
+func (fs *filesystem) newStubControllerFile(ctx context.Context, creds *auth.Credentials, data *atomicbitops.Int64, allowBackgroundAccess bool) kernfs.Inode {
 	f := &stubControllerFile{
+		controllerFile: controllerFile{
+			allowBackgroundAccess: allowBackgroundAccess,
+		},
 		data: data,
 	}
 	f.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), f, writableFileMode)

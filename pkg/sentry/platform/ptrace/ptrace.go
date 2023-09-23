@@ -40,8 +40,8 @@
 //
 // Lock order:
 //
-// subprocess.mu
-//   context.mu
+//	 subprocess.mu
+//		context.mu
 package ptrace
 
 import (
@@ -105,7 +105,7 @@ func (*PTrace) NewContext(ctx pkgcontext.Context) platform.Context {
 }
 
 // Switch runs the provided context in the given address space.
-func (c *context) Switch(ctx pkgcontext.Context, mm platform.MemoryManager, ac arch.Context, cpu int32) (*linux.SignalInfo, hostarch.AccessType, error) {
+func (c *context) Switch(ctx pkgcontext.Context, mm platform.MemoryManager, ac *arch.Context64, cpu int32) (*linux.SignalInfo, hostarch.AccessType, error) {
 	as := mm.AddressSpace()
 	s := as.(*subprocess)
 restart:
@@ -197,13 +197,17 @@ func (c *context) Release() {}
 func (c *context) FullStateChanged() {}
 
 // PullFullState implements platform.Context.PullFullState.
-func (c *context) PullFullState(as platform.AddressSpace, ac arch.Context) {}
+func (c *context) PullFullState(as platform.AddressSpace, ac *arch.Context64) error { return nil }
+
+// PrepareSleep implements platform.Context.platform.PrepareSleep.
+func (*context) PrepareSleep() {}
 
 // PTrace represents a collection of ptrace subprocesses.
 type PTrace struct {
 	platform.MMapMinAddr
 	platform.NoCPUPreemptionDetection
 	platform.UseHostGlobalMemoryBarrier
+	platform.DoesNotOwnPageTables
 }
 
 // New returns a new ptrace-based implementation of the platform interface.
@@ -251,7 +255,7 @@ func (*PTrace) MaxUserAddress() hostarch.Addr {
 }
 
 // NewAddressSpace returns a new subprocess.
-func (p *PTrace) NewAddressSpace(interface{}) (platform.AddressSpace, <-chan struct{}, error) {
+func (p *PTrace) NewAddressSpace(any) (platform.AddressSpace, <-chan struct{}, error) {
 	as, err := newSubprocess(globalPool.master.createStub)
 	return as, nil, err
 }

@@ -62,14 +62,12 @@ import (
 var (
 	empty   = &types.Empty{}
 	bufPool = sync.Pool{
-		New: func() interface{} {
+		New: func() any {
 			buffer := make([]byte, 32<<10)
 			return &buffer
 		},
 	}
 )
-
-var _ = (taskAPI.TaskService)(&service{})
 
 const (
 	// configFile is the default config file name. For containerd 1.2,
@@ -87,7 +85,7 @@ type oomPoller interface {
 	io.Closer
 	// add adds `cg` cgroup to oom poller. `cg` is cgroups.Cgroup in v1 and
 	// `cgroupsv2.Manager` in v2
-	add(id string, cg interface{}) error
+	add(id string, cg any) error
 	// run monitors oom event and notifies the shim about them
 	run(ctx context.Context)
 }
@@ -115,7 +113,7 @@ func New(ctx context.Context, id string, publisher shim.Publisher, cancel func()
 	s := &service{
 		id:             id,
 		processes:      make(map[string]process.Process),
-		events:         make(chan interface{}, 128),
+		events:         make(chan any, 128),
 		ec:             proc.ExitCh,
 		oomPoller:      ep,
 		cancel:         cancel,
@@ -138,11 +136,11 @@ func New(ctx context.Context, id string, publisher shim.Publisher, cancel func()
 
 // service is the shim implementation of a remote shim over GRPC. It runs in 2
 // different modes:
-//   1. Service: process runs for the life time of the container and receives
-//      calls described in shimapi.TaskService interface.
-//   2. Tool: process is short lived and runs only to perform the requested
-//      operations and then exits. It implements the direct functions in
-//      shim.Shim interface.
+//  1. Service: process runs for the life time of the container and receives
+//     calls described in shimapi.TaskService interface.
+//  2. Tool: process is short lived and runs only to perform the requested
+//     operations and then exits. It implements the direct functions in
+//     shim.Shim interface.
 //
 // When the service is running, it saves a json file with state information so
 // that commands sent to the tool can load the state and perform the operation.
@@ -162,7 +160,7 @@ type service struct {
 	// processes maps ExecId to processes running through exec.
 	processes map[string]process.Process
 
-	events chan interface{}
+	events chan any
 
 	// platform handles operations related to the console.
 	platform stdio.Platform
@@ -188,6 +186,8 @@ type service struct {
 	// shimAddress is the location of the UDS used to communicate to containerd.
 	shimAddress string
 }
+
+var _ shim.Shim = (*service)(nil)
 
 func (s *service) newCommand(ctx context.Context, containerdBinary, containerdAddress string) (*exec.Cmd, error) {
 	ns, err := namespaces.NamespaceRequired(ctx)
@@ -304,7 +304,7 @@ func (s *service) Cleanup(ctx context.Context) (*taskAPI.DeleteResponse, error) 
 	if err := st.load(path); err != nil {
 		return nil, err
 	}
-	r := proc.NewRunsc(s.opts.Root, path, ns, st.Options.BinaryName, nil)
+	r := proc.NewRunsc(s.opts.Root, path, ns, st.Options.BinaryName, nil, nil)
 
 	if err := r.Delete(ctx, s.id, &runsc.DeleteOpts{
 		Force: true,
@@ -323,6 +323,11 @@ func (s *service) Cleanup(ctx context.Context) (*taskAPI.DeleteResponse, error) 
 // Create creates a new initial process and container with the underlying OCI
 // runtime.
 func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (*taskAPI.CreateTaskResponse, error) {
+	resp, err := s.create(ctx, r)
+	return resp, errdefs.ToGRPC(err)
+}
+
+func (s *service) create(ctx context.Context, r *taskAPI.CreateTaskRequest) (*taskAPI.CreateTaskResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -395,6 +400,11 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (*ta
 			return nil, err
 		}
 		logrus.SetLevel(lvl)
+	}
+	for _, emittedPath := range runsc.EmittedPaths(s.id, s.opts.RunscConfig) {
+		if err := os.MkdirAll(filepath.Dir(emittedPath), 0777); err != nil {
+			return nil, fmt.Errorf("failed to create parent directories for file %v: %w", emittedPath, err)
+		}
 	}
 	if len(s.opts.LogPath) != 0 {
 		logPath := runsc.FormatShimLogPath(s.opts.LogPath, s.id)
@@ -481,10 +491,10 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (*ta
 	}
 	process, err := newInit(r.Bundle, filepath.Join(r.Bundle, "work"), ns, s.platform, config, &s.opts, st.Rootfs)
 	if err != nil {
-		return nil, utils.ErrToGRPC(err)
+		return nil, err
 	}
 	if err := process.Create(ctx, config); err != nil {
-		return nil, utils.ErrToGRPC(err)
+		return nil, err
 	}
 
 	// Set up OOM notification on the sandbox's cgroup. This is done on
@@ -492,7 +502,7 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (*ta
 	pid := process.Pid()
 	if pid > 0 {
 		var (
-			cg  interface{}
+			cg  any
 			err error
 		)
 		if cgroups.Mode() == cgroups.Unified {
@@ -522,6 +532,11 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (*ta
 
 // Start starts a process.
 func (s *service) Start(ctx context.Context, r *taskAPI.StartRequest) (*taskAPI.StartResponse, error) {
+	resp, err := s.start(ctx, r)
+	return resp, errdefs.ToGRPC(err)
+}
+
+func (s *service) start(ctx context.Context, r *taskAPI.StartRequest) (*taskAPI.StartResponse, error) {
 	log.L.Debugf("Start, id: %s, execID: %s", r.ID, r.ExecID)
 
 	p, err := s.getProcess(r.ExecID)
@@ -540,6 +555,11 @@ func (s *service) Start(ctx context.Context, r *taskAPI.StartRequest) (*taskAPI.
 
 // Delete deletes the initial process and container.
 func (s *service) Delete(ctx context.Context, r *taskAPI.DeleteRequest) (*taskAPI.DeleteResponse, error) {
+	resp, err := s.delete(ctx, r)
+	return resp, errdefs.ToGRPC(err)
+}
+
+func (s *service) delete(ctx context.Context, r *taskAPI.DeleteRequest) (*taskAPI.DeleteResponse, error) {
 	log.L.Debugf("Delete, id: %s, execID: %s", r.ID, r.ExecID)
 
 	p, err := s.getProcess(r.ExecID)
@@ -565,16 +585,21 @@ func (s *service) Delete(ctx context.Context, r *taskAPI.DeleteRequest) (*taskAP
 
 // Exec spawns an additional process inside the container.
 func (s *service) Exec(ctx context.Context, r *taskAPI.ExecProcessRequest) (*types.Empty, error) {
+	resp, err := s.exec(ctx, r)
+	return resp, errdefs.ToGRPC(err)
+}
+
+func (s *service) exec(ctx context.Context, r *taskAPI.ExecProcessRequest) (*types.Empty, error) {
 	log.L.Debugf("Exec, id: %s, execID: %s", r.ID, r.ExecID)
 
 	s.mu.Lock()
 	p := s.processes[r.ExecID]
 	s.mu.Unlock()
 	if p != nil {
-		return nil, utils.ErrToGRPCf(errdefs.ErrAlreadyExists, "id %s", r.ExecID)
+		return nil, errdefs.ToGRPCf(errdefs.ErrAlreadyExists, "id %s", r.ExecID)
 	}
 	if s.task == nil {
-		return nil, utils.ErrToGRPCf(errdefs.ErrFailedPrecondition, "container must be created")
+		return nil, errdefs.ToGRPCf(errdefs.ErrFailedPrecondition, "container must be created")
 	}
 	process, err := s.task.Exec(ctx, s.bundle, &proc.ExecConfig{
 		ID:       r.ExecID,
@@ -585,7 +610,7 @@ func (s *service) Exec(ctx context.Context, r *taskAPI.ExecProcessRequest) (*typ
 		Spec:     r.Spec,
 	})
 	if err != nil {
-		return nil, utils.ErrToGRPC(err)
+		return nil, err
 	}
 	s.mu.Lock()
 	s.processes[r.ExecID] = process
@@ -595,6 +620,11 @@ func (s *service) Exec(ctx context.Context, r *taskAPI.ExecProcessRequest) (*typ
 
 // ResizePty resizes the terminal of a process.
 func (s *service) ResizePty(ctx context.Context, r *taskAPI.ResizePtyRequest) (*types.Empty, error) {
+	resp, err := s.resizePty(ctx, r)
+	return resp, errdefs.ToGRPC(err)
+}
+
+func (s *service) resizePty(ctx context.Context, r *taskAPI.ResizePtyRequest) (*types.Empty, error) {
 	log.L.Debugf("ResizePty, id: %s, execID: %s, dimension: %dx%d", r.ID, r.ExecID, r.Height, r.Width)
 
 	p, err := s.getProcess(r.ExecID)
@@ -606,13 +636,18 @@ func (s *service) ResizePty(ctx context.Context, r *taskAPI.ResizePtyRequest) (*
 		Height: uint16(r.Height),
 	}
 	if err := p.Resize(ws); err != nil {
-		return nil, utils.ErrToGRPC(err)
+		return nil, err
 	}
 	return empty, nil
 }
 
 // State returns runtime state information for a process.
 func (s *service) State(ctx context.Context, r *taskAPI.StateRequest) (*taskAPI.StateResponse, error) {
+	resp, err := s.state(ctx, r)
+	return resp, errdefs.ToGRPC(err)
+}
+
+func (s *service) state(ctx context.Context, r *taskAPI.StateRequest) (*taskAPI.StateResponse, error) {
 	log.L.Debugf("State, id: %s, execID: %s", r.ID, r.ExecID)
 
 	p, err := s.getProcess(r.ExecID)
@@ -653,10 +688,15 @@ func (s *service) State(ctx context.Context, r *taskAPI.StateRequest) (*taskAPI.
 
 // Pause the container.
 func (s *service) Pause(ctx context.Context, r *taskAPI.PauseRequest) (*types.Empty, error) {
+	resp, err := s.pause(ctx, r)
+	return resp, errdefs.ToGRPC(err)
+}
+
+func (s *service) pause(ctx context.Context, r *taskAPI.PauseRequest) (*types.Empty, error) {
 	log.L.Debugf("Pause, id: %s", r.ID)
 	if s.task == nil {
 		log.L.Debugf("Pause error, id: %s: container not created", r.ID)
-		return nil, utils.ErrToGRPCf(errdefs.ErrFailedPrecondition, "container must be created")
+		return nil, errdefs.ToGRPCf(errdefs.ErrFailedPrecondition, "container must be created")
 	}
 	err := s.task.Runtime().Pause(ctx, r.ID)
 	if err != nil {
@@ -667,10 +707,15 @@ func (s *service) Pause(ctx context.Context, r *taskAPI.PauseRequest) (*types.Em
 
 // Resume the container.
 func (s *service) Resume(ctx context.Context, r *taskAPI.ResumeRequest) (*types.Empty, error) {
+	resp, err := s.resume(ctx, r)
+	return resp, errdefs.ToGRPC(err)
+}
+
+func (s *service) resume(ctx context.Context, r *taskAPI.ResumeRequest) (*types.Empty, error) {
 	log.L.Debugf("Resume, id: %s", r.ID)
 	if s.task == nil {
 		log.L.Debugf("Resume error, id: %s: container not created", r.ID)
-		return nil, utils.ErrToGRPCf(errdefs.ErrFailedPrecondition, "container must be created")
+		return nil, errdefs.ToGRPCf(errdefs.ErrFailedPrecondition, "container must be created")
 	}
 	err := s.task.Runtime().Resume(ctx, r.ID)
 	if err != nil {
@@ -681,6 +726,11 @@ func (s *service) Resume(ctx context.Context, r *taskAPI.ResumeRequest) (*types.
 
 // Kill a process with the provided signal.
 func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (*types.Empty, error) {
+	resp, err := s.kill(ctx, r)
+	return resp, errdefs.ToGRPC(err)
+}
+
+func (s *service) kill(ctx context.Context, r *taskAPI.KillRequest) (*types.Empty, error) {
 	log.L.Debugf("Kill, id: %s, execID: %s, signal: %d, all: %t", r.ID, r.ExecID, r.Signal, r.All)
 
 	p, err := s.getProcess(r.ExecID)
@@ -689,7 +739,7 @@ func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (*types.Empt
 	}
 	if err := p.Kill(ctx, r.Signal, r.All); err != nil {
 		log.L.Debugf("Kill failed: %v", err)
-		return nil, utils.ErrToGRPC(err)
+		return nil, err
 	}
 	log.L.Debugf("Kill succeeded")
 	return empty, nil
@@ -697,11 +747,16 @@ func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (*types.Empt
 
 // Pids returns all pids inside the container.
 func (s *service) Pids(ctx context.Context, r *taskAPI.PidsRequest) (*taskAPI.PidsResponse, error) {
+	resp, err := s.pids(ctx, r)
+	return resp, errdefs.ToGRPC(err)
+}
+
+func (s *service) pids(ctx context.Context, r *taskAPI.PidsRequest) (*taskAPI.PidsResponse, error) {
 	log.L.Debugf("Pids, id: %s", r.ID)
 
 	pids, err := s.getContainerPids(ctx, r.ID)
 	if err != nil {
-		return nil, utils.ErrToGRPC(err)
+		return nil, err
 	}
 	var processes []*task.ProcessInfo
 	for _, pid := range pids {
@@ -730,6 +785,11 @@ func (s *service) Pids(ctx context.Context, r *taskAPI.PidsRequest) (*taskAPI.Pi
 
 // CloseIO closes the I/O context of a process.
 func (s *service) CloseIO(ctx context.Context, r *taskAPI.CloseIORequest) (*types.Empty, error) {
+	resp, err := s.closeIO(ctx, r)
+	return resp, errdefs.ToGRPC(err)
+}
+
+func (s *service) closeIO(ctx context.Context, r *taskAPI.CloseIORequest) (*types.Empty, error) {
 	log.L.Debugf("CloseIO, id: %s, execID: %s, stdin: %t", r.ID, r.ExecID, r.Stdin)
 
 	p, err := s.getProcess(r.ExecID)
@@ -747,11 +807,16 @@ func (s *service) CloseIO(ctx context.Context, r *taskAPI.CloseIORequest) (*type
 // Checkpoint checkpoints the container.
 func (s *service) Checkpoint(ctx context.Context, r *taskAPI.CheckpointTaskRequest) (*types.Empty, error) {
 	log.L.Debugf("Checkpoint, id: %s", r.ID)
-	return empty, utils.ErrToGRPC(errdefs.ErrNotImplemented)
+	return empty, errdefs.ToGRPC(errdefs.ErrNotImplemented)
 }
 
 // Connect returns shim information such as the shim's pid.
 func (s *service) Connect(ctx context.Context, r *taskAPI.ConnectRequest) (*taskAPI.ConnectResponse, error) {
+	resp, err := s.connect(ctx, r)
+	return resp, errdefs.ToGRPC(err)
+}
+
+func (s *service) connect(ctx context.Context, r *taskAPI.ConnectRequest) (*taskAPI.ConnectResponse, error) {
 	log.L.Debugf("Connect, id: %s", r.ID)
 
 	var pid int
@@ -765,6 +830,11 @@ func (s *service) Connect(ctx context.Context, r *taskAPI.ConnectRequest) (*task
 }
 
 func (s *service) Shutdown(ctx context.Context, r *taskAPI.ShutdownRequest) (*types.Empty, error) {
+	resp, err := s.shutdown(ctx, r)
+	return resp, errdefs.ToGRPC(err)
+}
+
+func (s *service) shutdown(ctx context.Context, r *taskAPI.ShutdownRequest) (*types.Empty, error) {
 	log.L.Debugf("Shutdown, id: %s", r.ID)
 	s.cancel()
 	if s.shimAddress != "" {
@@ -775,10 +845,15 @@ func (s *service) Shutdown(ctx context.Context, r *taskAPI.ShutdownRequest) (*ty
 }
 
 func (s *service) Stats(ctx context.Context, r *taskAPI.StatsRequest) (*taskAPI.StatsResponse, error) {
+	resp, err := s.stats(ctx, r)
+	return resp, errdefs.ToGRPC(err)
+}
+
+func (s *service) stats(ctx context.Context, r *taskAPI.StatsRequest) (*taskAPI.StatsResponse, error) {
 	log.L.Debugf("Stats, id: %s", r.ID)
 	if s.task == nil {
 		log.L.Debugf("Stats error, id: %s: container not created", r.ID)
-		return nil, utils.ErrToGRPCf(errdefs.ErrFailedPrecondition, "container must be created")
+		return nil, errdefs.ToGRPCf(errdefs.ErrFailedPrecondition, "container must be created")
 	}
 	stats, err := s.task.Stats(ctx, s.id)
 	if err != nil {
@@ -852,11 +927,16 @@ func (s *service) Stats(ctx context.Context, r *taskAPI.StatsRequest) (*taskAPI.
 
 // Update updates a running container.
 func (s *service) Update(ctx context.Context, r *taskAPI.UpdateTaskRequest) (*types.Empty, error) {
-	return empty, utils.ErrToGRPC(errdefs.ErrNotImplemented)
+	return empty, errdefs.ToGRPC(errdefs.ErrNotImplemented)
 }
 
 // Wait waits for a process to exit.
 func (s *service) Wait(ctx context.Context, r *taskAPI.WaitRequest) (*taskAPI.WaitResponse, error) {
+	resp, err := s.wait(ctx, r)
+	return resp, errdefs.ToGRPC(err)
+}
+
+func (s *service) wait(ctx context.Context, r *taskAPI.WaitRequest) (*taskAPI.WaitResponse, error) {
 	log.L.Debugf("Wait, id: %s, execID: %s", r.ID, r.ExecID)
 
 	p, err := s.getProcess(r.ExecID)
@@ -949,19 +1029,19 @@ func (s *service) getProcess(execID string) (process.Process, error) {
 
 	if execID == "" {
 		if s.task == nil {
-			return nil, utils.ErrToGRPCf(errdefs.ErrFailedPrecondition, "container must be created")
+			return nil, errdefs.ToGRPCf(errdefs.ErrFailedPrecondition, "container must be created")
 		}
 		return s.task, nil
 	}
 
 	p := s.processes[execID]
 	if p == nil {
-		return nil, utils.ErrToGRPCf(errdefs.ErrNotFound, "process does not exist %s", execID)
+		return nil, errdefs.ToGRPCf(errdefs.ErrNotFound, "process does not exist %s", execID)
 	}
 	return p, nil
 }
 
-func getTopic(e interface{}) string {
+func getTopic(e any) string {
 	switch e.(type) {
 	case *events.TaskCreate:
 		return runtime.TaskCreateEventTopic
@@ -1001,8 +1081,8 @@ func newInit(path, workDir, namespace string, platform stdio.Platform, r *proc.C
 		}
 	}
 
-	runsc.FormatRunscLogPath(r.ID, options.RunscConfig)
-	runtime := proc.NewRunsc(options.Root, path, namespace, options.BinaryName, options.RunscConfig)
+	runsc.FormatRunscPaths(r.ID, options.RunscConfig)
+	runtime := proc.NewRunsc(options.Root, path, namespace, options.BinaryName, options.RunscConfig, spec)
 	p := proc.New(r.ID, runtime, stdio.Stdio{
 		Stdin:    r.Stdin,
 		Stdout:   r.Stdout,
@@ -1025,8 +1105,7 @@ func newInit(path, workDir, namespace string, platform stdio.Platform, r *proc.C
 // path. If found, it's set as an annotation in the spec. This is done so that
 // the sandbox joins the pod cgroup. Otherwise, the sandbox would join the pause
 // container cgroup. Returns true if the spec was modified. Ex.:
-//   /kubepods/burstable/pod123/container123 => kubepods/burstable/pod123
-//
+// /kubepods/burstable/pod123/container123 => kubepods/burstable/pod123
 func setPodCgroup(spec *specs.Spec) bool {
 	if !utils.IsSandbox(spec) {
 		return false

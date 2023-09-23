@@ -17,6 +17,7 @@ package p9
 import (
 	"fmt"
 
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/sync"
 )
 
@@ -25,11 +26,12 @@ import (
 // These are shared by all fidRefs that point to the same path.
 //
 // Lock ordering:
-//   opMu
-//     childMu
 //
-//   Two different pathNodes may only be locked if Server.renameMu is held for
-//   write, in which case they can be acquired in any order.
+//	opMu
+//	  childMu
+//
+// Two different pathNodes may only be locked if Server.renameMu is held for
+// write, in which case they can be acquired in any order.
 type pathNode struct {
 	// opMu synchronizes high-level, sematic operations, such as the
 	// simultaneous creation and deletion of a file.
@@ -40,7 +42,7 @@ type pathNode struct {
 	// already been unlinked. deleted is protected by opMu. However, it may be
 	// changed without opMu if this node is deleted as part of an entire subtree
 	// on unlink. So deleted must only be accessed/mutated using atomics.
-	deleted uint32
+	deleted atomicbitops.Uint32
 
 	// childMu protects the fields below.
 	childMu sync.RWMutex

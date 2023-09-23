@@ -29,11 +29,11 @@ import (
 // monotonic clock indicates that timeout has elapsed (only if haveTimeout is true),
 // or t is interrupted. It returns:
 //
-// - The remaining timeout, which is guaranteed to be 0 if the timeout expired,
-// and is unspecified if haveTimeout is false.
+//   - The remaining timeout, which is guaranteed to be 0 if the timeout expired,
+//     and is unspecified if haveTimeout is false.
 //
-// - An error which is nil if an event is received from C, ETIMEDOUT if the timeout
-// expired, and linuxerr.ErrInterrupted if t is interrupted.
+//   - An error which is nil if an event is received from C, ETIMEDOUT if the timeout
+//     expired, and linuxerr.ErrInterrupted if t is interrupted.
 //
 // Preconditions: The caller must be running on the task goroutine.
 func (t *Task) BlockWithTimeout(C chan struct{}, haveTimeout bool, timeout time.Duration) (time.Duration, error) {
@@ -114,11 +114,7 @@ func (t *Task) BlockWithTimer(C <-chan struct{}, tchan <-chan struct{}) error {
 	return t.block(C, tchan)
 }
 
-// Block blocks t until an event is received from C or t is interrupted. It
-// returns nil if an event is received from C and linuxerr.ErrInterrupted if t
-// is interrupted.
-//
-// Preconditions: The caller must be running on the task goroutine.
+// Block implements context.Context.Block
 func (t *Task) Block(C <-chan struct{}) error {
 	return t.block(C, nil)
 }
@@ -189,6 +185,7 @@ func (t *Task) block(C <-chan struct{}, timerChan <-chan struct{}) error {
 // prepareSleep prepares to sleep.
 func (t *Task) prepareSleep() {
 	t.assertTaskGoroutine()
+	t.p.PrepareSleep()
 	t.Deactivate()
 	t.accountTaskGoroutineEnter(TaskGoroutineBlockedInterruptible)
 }

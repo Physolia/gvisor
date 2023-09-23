@@ -94,10 +94,12 @@ func (fs *filesystem) MountOptions() string {
 //
 // +stateify savable
 type inode struct {
+	kernfs.InodeAnonymous
 	kernfs.InodeAttrs
 	kernfs.InodeNoopRefCount
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
+	kernfs.InodeWatches
 }
 
 // Open implements kernfs.Inode.Open.

@@ -36,19 +36,20 @@ func getTaskFD(t *kernel.Task, fd int32) (*vfs.FileDescription, kernel.FDFlags) 
 	)
 	t.WithMuLocked(func(t *kernel.Task) {
 		if fdt := t.FDTable(); fdt != nil {
-			file, flags = fdt.GetVFS2(fd)
+			file, flags = fdt.Get(fd)
 		}
 	})
 	return file, flags
 }
 
 func taskFDExists(ctx context.Context, fs *filesystem, t *kernel.Task, fd int32) bool {
-	file, _ := getTaskFD(t, fd)
-	if file == nil {
-		return false
-	}
-	fs.SafeDecRefFD(ctx, file)
-	return true
+	var exists bool
+	t.WithMuLocked(func(task *kernel.Task) {
+		if fdt := t.FDTable(); fdt != nil {
+			exists = fdt.Exists(fd)
+		}
+	})
+	return exists
 }
 
 // +stateify savable
@@ -112,8 +113,10 @@ type fdDirInode struct {
 	kernfs.InodeAlwaysValid
 	kernfs.InodeAttrs
 	kernfs.InodeDirectoryNoNewChildren
+	kernfs.InodeNotAnonymous
 	kernfs.InodeNotSymlink
 	kernfs.InodeTemporary
+	kernfs.InodeWatches
 	kernfs.OrderedChildren
 }
 
@@ -196,7 +199,9 @@ type fdSymlink struct {
 	implStatFS
 	kernfs.InodeAttrs
 	kernfs.InodeNoopRefCount
+	kernfs.InodeNotAnonymous
 	kernfs.InodeSymlink
+	kernfs.InodeWatches
 
 	fs   *filesystem
 	task *kernel.Task
@@ -254,8 +259,10 @@ type fdInfoDirInode struct {
 	kernfs.InodeAlwaysValid
 	kernfs.InodeAttrs
 	kernfs.InodeDirectoryNoNewChildren
+	kernfs.InodeNotAnonymous
 	kernfs.InodeNotSymlink
 	kernfs.InodeTemporary
+	kernfs.InodeWatches
 	kernfs.OrderedChildren
 }
 

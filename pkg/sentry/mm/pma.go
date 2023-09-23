@@ -34,8 +34,8 @@ import (
 // iterator.
 //
 // Preconditions:
-// * mm.activeMu must be locked.
-// * ar.Length() != 0.
+//   - mm.activeMu must be locked.
+//   - ar.Length() != 0.
 func (mm *MemoryManager) existingPMAsLocked(ar hostarch.AddrRange, at hostarch.AccessType, ignorePermissions bool, needInternalMappings bool) pmaIterator {
 	if checkInvariants {
 		if !ar.WellFormed() || ar.Length() == 0 {
@@ -84,22 +84,22 @@ func (mm *MemoryManager) existingVecPMAsLocked(ars hostarch.AddrRangeSeq, at hos
 // getPMAsLocked ensures that pmas exist for all addresses in ar, and support
 // access of type at. It returns:
 //
-// - An iterator to the pma containing ar.Start. If no pma contains ar.Start,
-// the iterator is unspecified.
+//   - An iterator to the pma containing ar.Start. If no pma contains ar.Start,
+//     the iterator is unspecified.
 //
-// - An iterator to the gap after the last pma containing an address in ar. If
-// pmas exist for no addresses in ar, the iterator is to a gap that begins
-// before ar.Start.
+//   - An iterator to the gap after the last pma containing an address in ar. If
+//     pmas exist for no addresses in ar, the iterator is to a gap that begins
+//     before ar.Start.
 //
-// - An error that is non-nil if pmas exist for only a subset of ar.
+//   - An error that is non-nil if pmas exist for only a subset of ar.
 //
 // Preconditions:
-// * mm.mappingMu must be locked.
-// * mm.activeMu must be locked for writing.
-// * ar.Length() != 0.
-// * vseg.Range().Contains(ar.Start).
-// * vmas must exist for all addresses in ar, and support accesses of type at
-//   (i.e. permission checks must have been performed against vmas).
+//   - mm.mappingMu must be locked.
+//   - mm.activeMu must be locked for writing.
+//   - ar.Length() != 0.
+//   - vseg.Range().Contains(ar.Start).
+//   - vmas must exist for all addresses in ar, and support accesses of type at
+//     (i.e. permission checks must have been performed against vmas).
 func (mm *MemoryManager) getPMAsLocked(ctx context.Context, vseg vmaIterator, ar hostarch.AddrRange, at hostarch.AccessType) (pmaIterator, pmaGapIterator, error) {
 	if checkInvariants {
 		if !ar.WellFormed() || ar.Length() == 0 {
@@ -143,10 +143,10 @@ func (mm *MemoryManager) getPMAsLocked(ctx context.Context, vseg vmaIterator, ar
 // why.
 //
 // Preconditions:
-// * mm.mappingMu must be locked.
-// * mm.activeMu must be locked for writing.
-// * vmas must exist for all addresses in ars, and support accesses of type at
-//   (i.e. permission checks must have been performed against vmas).
+//   - mm.mappingMu must be locked.
+//   - mm.activeMu must be locked for writing.
+//   - vmas must exist for all addresses in ars, and support accesses of type at
+//     (i.e. permission checks must have been performed against vmas).
 func (mm *MemoryManager) getVecPMAsLocked(ctx context.Context, ars hostarch.AddrRangeSeq, at hostarch.AccessType) (hostarch.AddrRangeSeq, error) {
 	for arsit := ars; !arsit.IsEmpty(); arsit = arsit.Tail() {
 		ar := arsit.Head()
@@ -183,16 +183,15 @@ func (mm *MemoryManager) getVecPMAsLocked(ctx context.Context, ars hostarch.Addr
 // getPMAsInternalLocked is equivalent to getPMAsLocked, with the following
 // exceptions:
 //
-// - getPMAsInternalLocked returns a pmaIterator on a best-effort basis (that
-// is, the returned iterator may be terminal, even if a pma that contains
-// ar.Start exists). Returning this iterator on a best-effort basis allows
-// callers that require it to use it when it's cheaply available, while also
-// avoiding the overhead of retrieving it when it's not.
+//   - getPMAsInternalLocked returns a pmaIterator on a best-effort basis (that
+//     is, the returned iterator may be terminal, even if a pma that contains
+//     ar.Start exists). Returning this iterator on a best-effort basis allows
+//     callers that require it to use it when it's cheaply available, while also
+//     avoiding the overhead of retrieving it when it's not.
 //
-// - getPMAsInternalLocked additionally requires that ar is page-aligned.
-//
-// getPMAsInternalLocked is an implementation helper for getPMAsLocked and
-// getVecPMAsLocked; other clients should call one of those instead.
+//   - getPMAsInternalLocked additionally requires that ar is page-aligned.
+//     getPMAsInternalLocked is an implementation helper for getPMAsLocked and
+//     getVecPMAsLocked; other clients should call one of those instead.
 func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIterator, ar hostarch.AddrRange, at hostarch.AccessType) (pmaIterator, pmaGapIterator, error) {
 	if checkInvariants {
 		if !ar.WellFormed() || ar.Length() == 0 || !ar.IsPageAligned() {
@@ -206,7 +205,8 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 		}
 	}
 
-	opts := pgalloc.AllocOpts{Kind: usage.Anonymous, Dir: pgalloc.BottomUp}
+	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
+	opts := pgalloc.AllocOpts{Kind: usage.Anonymous, Dir: pgalloc.BottomUp, MemCgID: memCgID}
 	vma := vseg.ValuePtr()
 	if uintptr(ar.Start) < atomic.LoadUintptr(&vma.lastFault) {
 		// Detect cases where memory is accessed downwards and change memory file
@@ -252,7 +252,7 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 					}
 					mm.addRSSLocked(allocAR)
 					mm.incPrivateRef(fr)
-					mf.IncRef(fr)
+					mf.IncRef(fr, memCgID)
 					pseg, pgap = mm.pmas.Insert(pgap, allocAR, pma{
 						file:           mf,
 						off:            fr.Start,
@@ -308,7 +308,7 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 							newpma.needCOW = true
 						}
 						mm.addRSSLocked(newpmaAR)
-						t.File.IncRef(t.FileRange())
+						t.File.IncRef(t.FileRange(), memCgID)
 						// This is valid because memmap.Mappable.Translate is
 						// required to return Translations in increasing
 						// Translation.Source order.
@@ -340,11 +340,11 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 						// The majority of copy-on-write breaks on executable
 						// pages come from:
 						//
-						// - The ELF loader, which must zero out bytes on the
-						// last page of each segment after the end of the
-						// segment.
+						//	- The ELF loader, which must zero out bytes on the
+						//		last page of each segment after the end of the
+						//		segment.
 						//
-						// - gdb's use of ptrace to insert breakpoints.
+						//	- gdb's use of ptrace to insert breakpoints.
 						//
 						// Neither of these cases has enough spatial locality
 						// to benefit from copying nearby pages, so if the vma
@@ -374,7 +374,12 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 						return pstart, pseg.PrevGap(), err
 					}
 					// Copy contents.
-					fr, err := mf.AllocateAndFill(uint64(copyAR.Length()), usage.Anonymous, &safemem.BlockSeqReader{mm.internalMappingsLocked(pseg, copyAR)})
+					fr, err := mf.Allocate(uint64(copyAR.Length()), pgalloc.AllocOpts{
+						Kind:    usage.Anonymous,
+						Mode:    pgalloc.AllocateAndWritePopulate,
+						MemCgID: memCgID,
+						Reader:  &safemem.BlockSeqReader{mm.internalMappingsLocked(pseg, copyAR)},
+					})
 					if _, ok := err.(safecopy.BusError); ok {
 						// If we got SIGBUS during the copy, deliver SIGBUS to
 						// userspace (instead of SIGSEGV) if we're breaking
@@ -405,7 +410,7 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 					}
 					oldpma.file.DecRef(pseg.fileRange())
 					mm.incPrivateRef(fr)
-					mf.IncRef(fr)
+					mf.IncRef(fr, memCgID)
 					oldpma.file = mf
 					oldpma.off = fr.Start
 					oldpma.translatePerms = hostarch.AnyAccess
@@ -485,7 +490,7 @@ func (mm *MemoryManager) getPMAsInternalLocked(ctx context.Context, vseg vmaIter
 							newpma.maxPerms.Write = false
 							newpma.needCOW = true
 						}
-						t.File.IncRef(t.FileRange())
+						t.File.IncRef(t.FileRange(), memCgID)
 						pseg = mm.pmas.Insert(pgap, newpmaAR, newpma)
 						pgap = pseg.NextGap()
 					}
@@ -554,9 +559,9 @@ func privateAligned(ar hostarch.AddrRange) hostarch.AddrRange {
 // and update the pma to indicate that it does not require copy-on-write.
 //
 // Preconditions:
-// * vseg.Range().IsSupersetOf(pseg.Range()).
-// * mm.mappingMu must be locked.
-// * mm.activeMu must be locked for writing.
+//   - vseg.Range().IsSupersetOf(pseg.Range()).
+//   - mm.mappingMu must be locked.
+//   - mm.activeMu must be locked for writing.
 func (mm *MemoryManager) isPMACopyOnWriteLocked(vseg vmaIterator, pseg pmaIterator) bool {
 	pma := pseg.ValuePtr()
 	if !pma.needCOW {
@@ -606,9 +611,9 @@ func (mm *MemoryManager) Invalidate(ar hostarch.AddrRange, opts memmap.Invalidat
 // addresses in ar.
 //
 // Preconditions:
-// * mm.activeMu must be locked for writing.
-// * ar.Length() != 0.
-// * ar must be page-aligned.
+//   - mm.activeMu must be locked for writing.
+//   - ar.Length() != 0.
+//   - ar must be page-aligned.
 func (mm *MemoryManager) invalidateLocked(ar hostarch.AddrRange, invalidatePrivate, invalidateShared bool) {
 	if checkInvariants {
 		if !ar.WellFormed() || ar.Length() == 0 || !ar.IsPageAligned() {
@@ -627,7 +632,27 @@ func (mm *MemoryManager) invalidateLocked(ar hostarch.AddrRange, invalidatePriva
 				// Unmap all of ar, not just pseg.Range(), to minimize host
 				// syscalls. AddressSpace mappings must be removed before
 				// mm.decPrivateRef().
-				mm.unmapASLocked(ar)
+				//
+				// Note that we do more than just ar here, and extrapolate
+				// to the end of any previous region that we may have mapped.
+				// This is done to ensure that lower layers can fully invalidate
+				// intermediate pagetable pages during the unmap.
+				var unmapAR hostarch.AddrRange
+				if prev := pseg.PrevSegment(); prev.Ok() {
+					unmapAR.Start = prev.End()
+				} else {
+					unmapAR.Start = mm.layout.MinAddr
+				}
+				if last := mm.pmas.LowerBoundSegment(ar.End); last.Ok() {
+					if last.Start() < ar.End {
+						unmapAR.End = ar.End
+					} else {
+						unmapAR.End = last.Start()
+					}
+				} else {
+					unmapAR.End = mm.layout.MaxAddr
+				}
+				mm.unmapASLocked(unmapAR)
 				didUnmapAS = true
 			}
 			if pma.private {
@@ -653,8 +678,8 @@ func (mm *MemoryManager) invalidateLocked(ar hostarch.AddrRange, invalidatePriva
 // in the Linux kernel.
 //
 // Preconditions:
-// * ar.Length() != 0.
-// * ar must be page-aligned.
+//   - ar.Length() != 0.
+//   - ar must be page-aligned.
 func (mm *MemoryManager) Pin(ctx context.Context, ar hostarch.AddrRange, at hostarch.AccessType, ignorePermissions bool) ([]PinnedRange, error) {
 	if checkInvariants {
 		if !ar.WellFormed() || ar.Length() == 0 || !ar.IsPageAligned() {
@@ -685,13 +710,14 @@ func (mm *MemoryManager) Pin(ctx context.Context, ar hostarch.AddrRange, at host
 		ar.End = pendaddr
 	}
 
+	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
 	// Gather pmas.
 	var prs []PinnedRange
 	for pseg.Ok() && pseg.Start() < ar.End {
 		psar := pseg.Range().Intersect(ar)
 		f := pseg.ValuePtr().file
 		fr := pseg.fileRangeOf(psar)
-		f.IncRef(fr)
+		f.IncRef(fr, memCgID)
 		prs = append(prs, PinnedRange{
 			Source: psar,
 			File:   f,
@@ -735,12 +761,12 @@ func Unpin(prs []PinnedRange) {
 // movePMAsLocked moves all pmas in oldAR to newAR.
 //
 // Preconditions:
-// * mm.activeMu must be locked for writing.
-// * oldAR.Length() != 0.
-// * oldAR.Length() <= newAR.Length().
-// * !oldAR.Overlaps(newAR).
-// * mm.pmas.IsEmptyRange(newAR).
-// * oldAR and newAR must be page-aligned.
+//   - mm.activeMu must be locked for writing.
+//   - oldAR.Length() != 0.
+//   - oldAR.Length() <= newAR.Length().
+//   - !oldAR.Overlaps(newAR).
+//   - mm.pmas.IsEmptyRange(newAR).
+//   - oldAR and newAR must be page-aligned.
 func (mm *MemoryManager) movePMAsLocked(oldAR, newAR hostarch.AddrRange) {
 	if checkInvariants {
 		if !oldAR.WellFormed() || oldAR.Length() == 0 || !oldAR.IsPageAligned() {
@@ -789,18 +815,18 @@ func (mm *MemoryManager) movePMAsLocked(oldAR, newAR hostarch.AddrRange) {
 // getPMAInternalMappingsLocked ensures that pmas for all addresses in ar have
 // cached internal mappings. It returns:
 //
-// - An iterator to the gap after the last pma with internal mappings
-// containing an address in ar. If internal mappings exist for no addresses in
-// ar, the iterator is to a gap that begins before ar.Start.
+//   - An iterator to the gap after the last pma with internal mappings
+//     containing an address in ar. If internal mappings exist for no addresses in
+//     ar, the iterator is to a gap that begins before ar.Start.
 //
-// - An error that is non-nil if internal mappings exist for only a subset of
-// ar.
+//   - An error that is non-nil if internal mappings exist for only a subset of
+//     ar.
 //
 // Preconditions:
-// * mm.activeMu must be locked for writing.
-// * pseg.Range().Contains(ar.Start).
-// * pmas must exist for all addresses in ar.
-// * ar.Length() != 0.
+//   - mm.activeMu must be locked for writing.
+//   - pseg.Range().Contains(ar.Start).
+//   - pmas must exist for all addresses in ar.
+//   - ar.Length() != 0.
 //
 // Postconditions: getPMAInternalMappingsLocked does not invalidate iterators
 // into mm.pmas.
@@ -831,8 +857,8 @@ func (mm *MemoryManager) getPMAInternalMappingsLocked(pseg pmaIterator, ar hosta
 // error explaining why.
 //
 // Preconditions:
-// * mm.activeMu must be locked for writing.
-// * pmas must exist for all addresses in ar.
+//   - mm.activeMu must be locked for writing.
+//   - pmas must exist for all addresses in ar.
 //
 // Postconditions: getVecPMAInternalMappingsLocked does not invalidate iterators
 // into mm.pmas.
@@ -852,11 +878,11 @@ func (mm *MemoryManager) getVecPMAInternalMappingsLocked(ars hostarch.AddrRangeS
 // internalMappingsLocked returns internal mappings for addresses in ar.
 //
 // Preconditions:
-// * mm.activeMu must be locked.
-// * Internal mappings must have been previously established for all addresses
-//   in ar.
-// * ar.Length() != 0.
-// * pseg.Range().Contains(ar.Start).
+//   - mm.activeMu must be locked.
+//   - Internal mappings must have been previously established for all addresses
+//     in ar.
+//   - ar.Length() != 0.
+//   - pseg.Range().Contains(ar.Start).
 func (mm *MemoryManager) internalMappingsLocked(pseg pmaIterator, ar hostarch.AddrRange) safemem.BlockSeq {
 	if checkInvariants {
 		if !ar.WellFormed() || ar.Length() == 0 {
@@ -891,9 +917,9 @@ func (mm *MemoryManager) internalMappingsLocked(pseg pmaIterator, ar hostarch.Ad
 // vecInternalMappingsLocked returns internal mappings for addresses in ars.
 //
 // Preconditions:
-// * mm.activeMu must be locked.
-// * Internal mappings must have been previously established for all addresses
-//   in ars.
+//   - mm.activeMu must be locked.
+//   - Internal mappings must have been previously established for all addresses
+//     in ars.
 func (mm *MemoryManager) vecInternalMappingsLocked(ars hostarch.AddrRangeSeq) safemem.BlockSeq {
 	var ims []safemem.Block
 	for ; !ars.IsEmpty(); ars = ars.Tail() {
@@ -1023,8 +1049,8 @@ func (pmaSetFunctions) Split(ar hostarch.AddrRange, p pma, split hostarch.Addr) 
 // so by scanning linearly backward from pgap.
 //
 // Preconditions:
-// * mm.activeMu must be locked.
-// * addr <= pgap.Start().
+//   - mm.activeMu must be locked.
+//   - addr <= pgap.Start().
 func (mm *MemoryManager) findOrSeekPrevUpperBoundPMA(addr hostarch.Addr, pgap pmaGapIterator) pmaIterator {
 	if checkInvariants {
 		if !pgap.Ok() {
@@ -1071,8 +1097,8 @@ func (pseg pmaIterator) fileRange() memmap.FileRange {
 }
 
 // Preconditions:
-// * pseg.Range().IsSupersetOf(ar).
-// * ar.Length != 0.
+//   - pseg.Range().IsSupersetOf(ar).
+//   - ar.Length != 0.
 func (pseg pmaIterator) fileRangeOf(ar hostarch.AddrRange) memmap.FileRange {
 	if checkInvariants {
 		if !pseg.Ok() {

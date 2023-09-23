@@ -41,8 +41,10 @@ type tasksInode struct {
 	kernfs.InodeAlwaysValid
 	kernfs.InodeAttrs
 	kernfs.InodeDirectoryNoNewChildren
+	kernfs.InodeNotAnonymous
 	kernfs.InodeNotSymlink
 	kernfs.InodeTemporary // This holds no meaning as this inode can't be Looked up and is always valid.
+	kernfs.InodeWatches
 	kernfs.OrderedChildren
 	tasksInodeRefs
 
@@ -65,17 +67,22 @@ var _ kernfs.Inode = (*tasksInode)(nil)
 func (fs *filesystem) newTasksInode(ctx context.Context, k *kernel.Kernel, pidns *kernel.PIDNamespace, fakeCgroupControllers map[string]string) *tasksInode {
 	root := auth.NewRootCredentials(pidns.UserNamespace())
 	contents := map[string]kernfs.Inode{
-		"cmdline":     fs.newInode(ctx, root, 0444, &cmdLineData{}),
-		"cpuinfo":     fs.newInode(ctx, root, 0444, newStaticFileSetStat(cpuInfoData(k))),
-		"filesystems": fs.newInode(ctx, root, 0444, &filesystemsData{}),
-		"loadavg":     fs.newInode(ctx, root, 0444, &loadavgData{}),
-		"sys":         fs.newSysDir(ctx, root, k),
-		"meminfo":     fs.newInode(ctx, root, 0444, &meminfoData{}),
-		"mounts":      kernfs.NewStaticSymlink(ctx, root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "self/mounts"),
-		"net":         kernfs.NewStaticSymlink(ctx, root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "self/net"),
-		"stat":        fs.newInode(ctx, root, 0444, &statData{}),
-		"uptime":      fs.newInode(ctx, root, 0444, &uptimeData{}),
-		"version":     fs.newInode(ctx, root, 0444, &versionData{}),
+		"cmdline":        fs.newInode(ctx, root, 0444, &cmdLineData{}),
+		"cpuinfo":        fs.newInode(ctx, root, 0444, newStaticFileSetStat(cpuInfoData(k))),
+		"filesystems":    fs.newInode(ctx, root, 0444, &filesystemsData{}),
+		"loadavg":        fs.newInode(ctx, root, 0444, &loadavgData{}),
+		"sys":            fs.newSysDir(ctx, root, k),
+		"bus":            fs.newStaticDir(ctx, root, map[string]kernfs.Inode{}),
+		"fs":             fs.newStaticDir(ctx, root, map[string]kernfs.Inode{}),
+		"irq":            fs.newStaticDir(ctx, root, map[string]kernfs.Inode{}),
+		"meminfo":        fs.newInode(ctx, root, 0444, &meminfoData{}),
+		"mounts":         kernfs.NewStaticSymlink(ctx, root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "self/mounts"),
+		"net":            kernfs.NewStaticSymlink(ctx, root, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), "self/net"),
+		"sentry-meminfo": fs.newInode(ctx, root, 0444, &sentryMeminfoData{}),
+		"stat":           fs.newInode(ctx, root, 0444, &statData{}),
+		"sysrq-trigger":  fs.newInode(ctx, root, 0200, newStaticFile("")),
+		"uptime":         fs.newInode(ctx, root, 0444, &uptimeData{}),
+		"version":        fs.newInode(ctx, root, 0444, &versionData{}),
 	}
 	// If fakeCgroupControllers are provided, don't create a cgroupfs backed
 	// /proc/cgroup as it will not match the fake controllers.

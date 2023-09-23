@@ -45,7 +45,8 @@ type donation struct {
 
 // Donate sets up the given files to be donated to another process. The FD
 // in which the new file will appear in the child process is added as a flag to
-// the child process, e.g. --flag=3.
+// the child process, e.g. --flag=3. In case the file is nil, -1 is used for the
+// flag value and no file is donated to the next process.
 func (f *Agency) Donate(flag string, files ...*os.File) {
 	f.donations = append(f.donations, donation{flag: flag, files: files})
 }
@@ -91,9 +92,13 @@ func (f *Agency) DonateDebugLogFile(flag, logPattern, command, test string) erro
 func (f *Agency) Transfer(cmd *exec.Cmd, nextFD int) int {
 	for _, d := range f.donations {
 		for _, file := range d.files {
-			cmd.ExtraFiles = append(cmd.ExtraFiles, file)
-			cmd.Args = append(cmd.Args, fmt.Sprintf("--%s=%d", d.flag, nextFD))
-			nextFD++
+			fd := -1
+			if file != nil {
+				cmd.ExtraFiles = append(cmd.ExtraFiles, file)
+				fd = nextFD
+				nextFD++
+			}
+			cmd.Args = append(cmd.Args, fmt.Sprintf("--%s=%d", d.flag, fd))
 		}
 	}
 	// Reset donations made so far in case more transfers are needed.
@@ -101,10 +106,23 @@ func (f *Agency) Transfer(cmd *exec.Cmd, nextFD int) int {
 	return nextFD
 }
 
+// DonateAndTransferCustomFiles sets up the flags for passing file descriptors from the
+// host to the sandbox. Making use of the agency is not necessary,
+func DonateAndTransferCustomFiles(cmd *exec.Cmd, nextFD int, files map[int]*os.File) int {
+	for fd, file := range files {
+		cmd.Args = append(cmd.Args, fmt.Sprintf("--pass-fd=%d:%d", nextFD, fd))
+		cmd.ExtraFiles = append(cmd.ExtraFiles, file)
+		nextFD++
+	}
+	return nextFD
+}
+
 // Close closes any files the agency has taken ownership over.
 func (f *Agency) Close() {
 	for _, file := range f.closePending {
-		_ = file.Close()
+		if file != nil {
+			_ = file.Close()
+		}
 	}
 	f.closePending = nil
 }

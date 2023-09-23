@@ -22,7 +22,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
-	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
@@ -31,7 +30,7 @@ import (
 // +stateify savable
 type aioManager struct {
 	// mu protects below.
-	mu sync.Mutex `state:"nosave"`
+	mu aioManagerMutex `state:"nosave"`
 
 	// aioContexts is the set of asynchronous I/O contexts.
 	contexts map[uint64]*AIOContext
@@ -96,7 +95,7 @@ func (a *aioManager) lookupAIOContext(id uint64) (*AIOContext, bool) {
 //
 // +stateify savable
 type ioResult struct {
-	data interface{}
+	data any
 	ioEntry
 }
 
@@ -108,7 +107,7 @@ type AIOContext struct {
 	requestReady chan struct{} `state:"nosave"`
 
 	// mu protects below.
-	mu sync.Mutex `state:"nosave"`
+	mu aioContextMutex `state:"nosave"`
 
 	// results is the set of completed requests.
 	results ioList
@@ -161,7 +160,7 @@ func (ctx *AIOContext) Prepare() error {
 
 // PopRequest pops a completed request if available, this function does not do
 // any blocking. Returns false if no request is available.
-func (ctx *AIOContext) PopRequest() (interface{}, bool) {
+func (ctx *AIOContext) PopRequest() (any, bool) {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
 
@@ -180,7 +179,7 @@ func (ctx *AIOContext) PopRequest() (interface{}, bool) {
 
 // FinishRequest finishes a pending request. It queues up the data
 // and notifies listeners.
-func (ctx *AIOContext) FinishRequest(data interface{}) {
+func (ctx *AIOContext) FinishRequest(data any) {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
 
@@ -253,8 +252,8 @@ type aioMappable struct {
 
 var aioRingBufferSize = uint64(hostarch.Addr(linux.AIORingSize).MustRoundUp())
 
-func newAIOMappable(mfp pgalloc.MemoryFileProvider) (*aioMappable, error) {
-	fr, err := mfp.MemoryFile().Allocate(aioRingBufferSize, pgalloc.AllocOpts{Kind: usage.Anonymous})
+func newAIOMappable(ctx context.Context, mfp pgalloc.MemoryFileProvider) (*aioMappable, error) {
+	fr, err := mfp.MemoryFile().Allocate(aioRingBufferSize, pgalloc.AllocOpts{Kind: usage.Anonymous, MemCgID: pgalloc.MemoryCgroupIDFromContext(ctx)})
 	if err != nil {
 		return nil, err
 	}
@@ -369,7 +368,7 @@ func (mm *MemoryManager) NewAIOContext(ctx context.Context, events uint32) (uint
 	// libaio peeks inside looking for a magic number. This function allocates
 	// a page per context and keeps it set to zeroes to ensure it will not
 	// match AIO_RING_MAGIC and make libaio happy.
-	m, err := newAIOMappable(mm.mfp)
+	m, err := newAIOMappable(ctx, mm.mfp)
 	if err != nil {
 		return 0, err
 	}

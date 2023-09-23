@@ -20,10 +20,10 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/cpuid"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/ipc"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/shm"
 	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
@@ -52,7 +52,7 @@ func (*Task) Err() error {
 // Value implements context.Context.Value.
 //
 // Preconditions: The caller must be running on the task goroutine.
-func (t *Task) Value(key interface{}) interface{} {
+func (t *Task) Value(key any) any {
 	// This function is very hot; skip this check outside of +race builds.
 	if sync.RaceEnabled {
 		t.assertTaskGoroutine()
@@ -60,7 +60,7 @@ func (t *Task) Value(key interface{}) interface{} {
 	return t.contextValue(key, true /* isTaskGoroutine */)
 }
 
-func (t *Task) contextValue(key interface{}, isTaskGoroutine bool) interface{} {
+func (t *Task) contextValue(key any, isTaskGoroutine bool) any {
 	switch key {
 	case CtxCanTrace:
 		return t.CanTrace
@@ -73,7 +73,9 @@ func (t *Task) contextValue(key interface{}, isTaskGoroutine bool) interface{} {
 			t.mu.Lock()
 			defer t.mu.Unlock()
 		}
-		return t.utsns
+		utsns := t.utsns
+		utsns.IncRef()
+		return utsns
 	case ipc.CtxIPCNamespace:
 		if !isTaskGoroutine {
 			t.mu.Lock()
@@ -88,27 +90,19 @@ func (t *Task) contextValue(key interface{}, isTaskGoroutine bool) interface{} {
 		return t.creds.Load()
 	case auth.CtxThreadGroupID:
 		return int32(t.tg.ID())
-	case fs.CtxRoot:
-		if !isTaskGoroutine {
-			t.mu.Lock()
-			defer t.mu.Unlock()
-		}
-		return t.fsContext.RootDirectory()
 	case vfs.CtxRoot:
 		if !isTaskGoroutine {
 			t.mu.Lock()
 			defer t.mu.Unlock()
 		}
-		return t.fsContext.RootDirectoryVFS2()
+		return t.fsContext.RootDirectory()
 	case vfs.CtxMountNamespace:
 		if !isTaskGoroutine {
 			t.mu.Lock()
 			defer t.mu.Unlock()
 		}
-		t.mountNamespaceVFS2.IncRef()
-		return t.mountNamespaceVFS2
-	case fs.CtxDirentCacheLimiter:
-		return t.k.DirentCacheLimiter
+		t.mountNamespace.IncRef()
+		return t.mountNamespace
 	case inet.CtxStack:
 		return t.NetworkContext()
 	case ktime.CtxRealtimeClock:
@@ -119,12 +113,16 @@ func (t *Task) contextValue(key interface{}, isTaskGoroutine bool) interface{} {
 		return func(sig linux.Signal) error {
 			return t.SendSignal(SignalInfoNoInfo(sig, t, t))
 		}
+	case pgalloc.CtxMemoryCgroupID:
+		return t.memCgID.Load()
 	case pgalloc.CtxMemoryFile:
 		return t.k.mf
 	case pgalloc.CtxMemoryFileProvider:
 		return t.k
 	case platform.CtxPlatform:
 		return t.k
+	case shm.CtxDeviceID:
+		return t.k.sysVShmDevID
 	case uniqueid.CtxGlobalUniqueID:
 		return t.k.UniqueID()
 	case uniqueid.CtxGlobalUniqueIDProvider:
@@ -154,7 +152,7 @@ type taskAsyncContext struct {
 }
 
 // Value implements context.Context.Value.
-func (t *taskAsyncContext) Value(key interface{}) interface{} {
+func (t *taskAsyncContext) Value(key any) any {
 	return t.fallbackTask.contextValue(key, false /* isTaskGoroutine */)
 }
 

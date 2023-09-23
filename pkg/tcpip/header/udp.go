@@ -19,6 +19,7 @@ import (
 	"math"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 )
 
 const (
@@ -100,8 +101,8 @@ func (b UDP) SetDestinationPort(port uint16) {
 }
 
 // SetChecksum sets the "checksum" field of the UDP header.
-func (b UDP) SetChecksum(checksum uint16) {
-	PutChecksum(b[udpChecksum:], checksum)
+func (b UDP) SetChecksum(xsum uint16) {
+	checksum.Put(b[udpChecksum:], xsum)
 }
 
 // SetLength sets the "length" field of the UDP header.
@@ -113,13 +114,13 @@ func (b UDP) SetLength(length uint16) {
 // checksum of the network-layer pseudo-header and the checksum of the payload.
 func (b UDP) CalculateChecksum(partialChecksum uint16) uint16 {
 	// Calculate the rest of the checksum.
-	return Checksum(b[:UDPMinimumSize], partialChecksum)
+	return checksum.Checksum(b[:UDPMinimumSize], partialChecksum)
 }
 
 // IsChecksumValid returns true iff the UDP header's checksum is valid.
 func (b UDP) IsChecksumValid(src, dst tcpip.Address, payloadChecksum uint16) bool {
 	xsum := PseudoHeaderChecksum(UDPProtocolNumber, dst, src, b.Length())
-	xsum = ChecksumCombine(xsum, payloadChecksum)
+	xsum = checksum.Combine(xsum, payloadChecksum)
 	return b.CalculateChecksum(xsum) == 0xffff
 }
 
@@ -158,4 +159,37 @@ func (b UDP) UpdateChecksumPseudoHeaderAddress(old, new tcpip.Address, fullCheck
 	}
 
 	b.SetChecksum(xsum)
+}
+
+// UDPValid returns true if the pkt has a valid UDP header. It checks whether:
+//   - The length field is too small.
+//   - The length field is too large.
+//   - The checksum is invalid.
+//
+// UDPValid corresponds to net/netfilter/nf_conntrack_proto_udp.c:udp_error.
+func UDPValid(hdr UDP, payloadChecksum func() uint16, payloadSize uint16, netProto tcpip.NetworkProtocolNumber, srcAddr, dstAddr tcpip.Address, skipChecksumValidation bool) (lengthValid, csumValid bool) {
+	if length := hdr.Length(); length > payloadSize+UDPMinimumSize || length < UDPMinimumSize {
+		return false, false
+	}
+
+	if skipChecksumValidation {
+		return true, true
+	}
+
+	// On IPv4, UDP checksum is optional, and a zero value means the transmitter
+	// omitted the checksum generation, as per RFC 768:
+	//
+	//   An all zero transmitted checksum value means that the transmitter
+	//   generated  no checksum  (for debugging or for higher level protocols that
+	//   don't care).
+	//
+	// On IPv6, UDP checksum is not optional, as per RFC 2460 Section 8.1:
+	//
+	//   Unlike IPv4, when UDP packets are originated by an IPv6 node, the UDP
+	//   checksum is not optional.
+	if netProto == IPv4ProtocolNumber && hdr.Checksum() == 0 {
+		return true, true
+	}
+
+	return true, hdr.IsChecksumValid(srcAddr, dstAddr, payloadChecksum())
 }

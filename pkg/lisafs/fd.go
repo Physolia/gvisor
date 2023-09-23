@@ -18,7 +18,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
+	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sync"
 )
 
@@ -36,9 +36,9 @@ func (f FDID) Ok() bool {
 	return f != InvalidFDID
 }
 
-// genericFD can represent a ControlFD or OpenFD.
+// genericFD can represent any type of FD.
 type genericFD interface {
-	refsvfs2.RefCounter
+	refs.RefCounter
 }
 
 // A ControlFD is the gateway to the backing filesystem tree node. It is an
@@ -53,7 +53,7 @@ type genericFD interface {
 // being performed.
 //
 // Reference Model:
-// * Each control FD holds a ref on its Node for its entire lifetime.
+//   - Each control FD holds a ref on its Node for its entire lifetime.
 type ControlFD struct {
 	controlFDRefs
 	controlFDEntry
@@ -84,9 +84,9 @@ type ControlFD struct {
 
 var _ genericFD = (*ControlFD)(nil)
 
-// DecRef implements refsvfs2.RefCounter.DecRef. Note that the context
+// DecRef implements refs.RefCounter.DecRef. Note that the context
 // parameter should never be used. It exists solely to comply with the
-// refsvfs2.RefCounter interface.
+// refs.RefCounter interface.
 func (fd *ControlFD) DecRef(context.Context) {
 	fd.controlFDRefs.DecRef(func() {
 		fd.conn.server.renameMu.RLock()
@@ -120,8 +120,8 @@ func (fd *ControlFD) destroyLocked() {
 // filesystem tree.
 //
 // Preconditions:
-// * server's rename mutex must be at least read locked.
-// * The caller must take a ref on node which is transferred to fd.
+//   - server's rename mutex must be at least read locked.
+//   - The caller must take a ref on node which is transferred to fd.
 func (fd *ControlFD) Init(c *Connection, node *Node, mode linux.FileMode, impl ControlFDImpl) {
 	fd.conn = c
 	fd.node = node
@@ -172,9 +172,9 @@ func (fd *ControlFD) Node() *Node {
 // RemoveFromConn removes this control FD from its owning connection.
 //
 // Preconditions:
-// * fd should not have been returned to the client. Otherwise the client can
-//   still refer to it.
-// * server's rename mutex must at least be read locked.
+//   - fd should not have been returned to the client. Otherwise the client can
+//     still refer to it.
+//   - server's rename mutex must at least be read locked.
 func (fd *ControlFD) RemoveFromConn() {
 	fd.conn.removeControlFDLocked(fd.id)
 }
@@ -224,7 +224,7 @@ func (fd *ControlFD) forEachOpenFD(fn func(ofd *OpenFD)) {
 // tree. See OpenFDImpl for the supported operations.
 //
 // Reference Model:
-// * An OpenFD takes a reference on the control FD it was opened on.
+//   - An OpenFD takes a reference on the control FD it was opened on.
 type OpenFD struct {
 	openFDRefs
 	openFDEntry
@@ -254,9 +254,9 @@ func (fd *OpenFD) ControlFD() ControlFDImpl {
 	return fd.controlFD.impl
 }
 
-// DecRef implements refsvfs2.RefCounter.DecRef. Note that the context
+// DecRef implements refs.RefCounter.DecRef. Note that the context
 // parameter should never be used. It exists solely to comply with the
-// refsvfs2.RefCounter interface.
+// refs.RefCounter interface.
 func (fd *OpenFD) DecRef(context.Context) {
 	fd.openFDRefs.DecRef(func() {
 		fd.controlFD.openFDsMu.Lock()
@@ -281,6 +281,54 @@ func (fd *OpenFD) Init(cfd *ControlFD, flags uint32, impl OpenFDImpl) {
 	cfd.openFDsMu.Lock()
 	cfd.openFDs.PushBack(fd)
 	cfd.openFDsMu.Unlock()
+}
+
+// BoundSocketFD represents a bound socket on the server.
+//
+// Reference Model:
+//   - A BoundSocketFD takes a reference on the control FD it is bound to.
+type BoundSocketFD struct {
+	boundSocketFDRefs
+
+	// All the following fields are immutable.
+
+	// controlFD is the ControlFD on which this FD was bound. BoundSocketFD
+	// holds a ref on controlFD for its entire lifetime.
+	controlFD *ControlFD
+
+	// id is the unique FD identifier which identifies this FD on its connection.
+	id FDID
+
+	// impl is the socket FD implementation which embeds this struct. It
+	// contains all the implementation specific details.
+	impl BoundSocketFDImpl
+}
+
+var _ genericFD = (*BoundSocketFD)(nil)
+
+// ControlFD returns the control FD on which this FD was bound.
+func (fd *BoundSocketFD) ControlFD() ControlFDImpl {
+	return fd.controlFD.impl
+}
+
+// DecRef implements refs.RefCounter.DecRef. Note that the context
+// parameter should never be used. It exists solely to comply with the
+// refs.RefCounter interface.
+func (fd *BoundSocketFD) DecRef(context.Context) {
+	fd.boundSocketFDRefs.DecRef(func() {
+		fd.controlFD.DecRef(nil) // Drop the ref on the control FD.
+		fd.impl.Close()
+	})
+}
+
+// Init must be called before first use of fd.
+func (fd *BoundSocketFD) Init(cfd *ControlFD, impl BoundSocketFDImpl) {
+	// Initialize fd with 1 ref which is transferred to c via c.insertFD().
+	fd.boundSocketFDRefs.InitRefs()
+	fd.controlFD = cfd
+	fd.id = cfd.conn.insertFD(fd)
+	fd.impl = impl
+	cfd.IncRef() // Holds a ref on cfd for its lifetime.
 }
 
 // There are four different types of guarantees provided:
@@ -436,6 +484,16 @@ type ControlFDImpl interface {
 	// On the server, Connect has a read concurrency guarantee.
 	Connect(sockType uint32) (int, error)
 
+	// BindAt creates a host unix domain socket of type sockType, bound to
+	// the given namt of type sockType, bound to the given name. It returns
+	// a ControlFD that can be used for path operations on the socket, a
+	// BoundSocketFD that can be used to Accept/Listen on the socket, and a
+	// host FD that can be used for event notifications (like new
+	// connections).
+	//
+	// On the server, BindAt has a write concurrency guarantee.
+	BindAt(name string, sockType uint32, mode linux.FileMode, uid UID, gid GID) (*ControlFD, linux.Statx, *BoundSocketFD, int, error)
+
 	// UnlinkAt the file identified by name in this directory.
 	//
 	// Flags are Linux unlinkat(2) flags.
@@ -559,4 +617,32 @@ type OpenFDImpl interface {
 	//
 	// On the server, Renamed has a global concurrency guarantee.
 	Renamed()
+}
+
+// BoundSocketFDImpl represents a socket on the host filesystem that has been
+// created by the sandboxed application via Bind.
+type BoundSocketFDImpl interface {
+	// FD returns a pointer to the embedded BoundSocketFD.
+	FD() *BoundSocketFD
+
+	// Listen marks the socket as accepting incoming connections.
+	//
+	// On the server, Listen has a read concurrency guarantee.
+	Listen(backlog int32) error
+
+	// Accept takes the first pending connection and creates a new socket
+	// for it. The new socket FD is returned along with the peer address of
+	// the connecting socket (which may be empty string).
+	//
+	// On the server, Accept has a read concurrency guarantee.
+	Accept() (int, string, error)
+
+	// Close should clean up resources used by the bound socket FD
+	// implementation.
+	//
+	// Close is called after all references on the FD have been dropped and its
+	// FDID has been released.
+	//
+	// On the server, Close has no concurrency guarantee.
+	Close()
 }

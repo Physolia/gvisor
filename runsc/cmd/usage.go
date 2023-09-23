@@ -17,10 +17,9 @@ package cmd
 import (
 	"context"
 	"encoding/json"
-	"fmt"
-	"os"
 
 	"github.com/google/subcommands"
+	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
 	"gvisor.dev/gvisor/runsc/flag"
@@ -44,7 +43,8 @@ func (*Usage) Synopsis() string {
 
 // Usage implements subcommands.Command.Usage.
 func (*Usage) Usage() string {
-	return `usage [flags] <container id> - print memory usages to standard output.`
+	return `usage [flags] <container id> - print memory usages to standard output.
+`
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
@@ -54,7 +54,7 @@ func (u *Usage) SetFlags(f *flag.FlagSet) {
 }
 
 // Execute implements subcommands.Command.Execute.
-func (u *Usage) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (u *Usage) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if f.NArg() < 1 {
 		f.Usage()
 		return subcommands.ExitUsageError
@@ -63,31 +63,33 @@ func (u *Usage) Execute(_ context.Context, f *flag.FlagSet, args ...interface{})
 	id := f.Arg(0)
 	conf := args[0].(*config.Config)
 
-	cont, err := container.Load(conf.RootDir, container.FullID{ContainerID: id}, container.LoadOpts{})
+	cont, err := container.Load(conf.RootDir, container.FullID{ContainerID: id}, container.LoadOpts{SkipCheck: true})
 	if err != nil {
-		Fatalf("loading container: %v", err)
+		util.Fatalf("loading container: %v", err)
 	}
 
-	if !u.fd {
-		m, err := cont.Usage(u.full)
+	if u.fd {
+		m, err := cont.Sandbox.UsageFD()
 		if err != nil {
-			Fatalf("usage failed: %v", err)
-		}
-		if err := json.NewEncoder(os.Stdout).Encode(m); err != nil {
-			Fatalf("Encode MemoryUsage failed: %v", err)
-		}
-	} else {
-		m, err := cont.UsageFD()
-		if err != nil {
-			Fatalf("usagefd failed: %v", err)
+			util.Fatalf("usagefd failed: %v", err)
 		}
 
 		mapped, unknown, total, err := m.Fetch()
 		if err != nil {
-			Fatalf("Fetch memory usage failed: %v", err)
+			util.Fatalf("Fetch memory usage failed: %v", err)
 		}
 
-		fmt.Printf("Mapped %v, Unknown %v, Total %v\n", mapped, unknown, total)
+		util.Infof("Mapped %v, Unknown %v, Total %v\n", mapped, unknown, total)
+	} else {
+		m, err := cont.Sandbox.Usage(u.full)
+		if err != nil {
+			util.Fatalf("usage failed: %v", err)
+		}
+		encoder := json.NewEncoder(&util.Writer{})
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(m); err != nil {
+			util.Fatalf("Encode MemoryUsage failed: %v", err)
+		}
 	}
 	return subcommands.ExitSuccess
 }

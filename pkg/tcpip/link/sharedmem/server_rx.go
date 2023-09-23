@@ -18,9 +18,9 @@
 package sharedmem
 
 import (
-	"sync/atomic"
-
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/eventfd"
 	"gvisor.dev/gvisor/pkg/tcpip/link/sharedmem/pipe"
@@ -47,7 +47,7 @@ type serverRx struct {
 
 	// sharedEventFDState is the memory region in sharedData used to enable
 	// disable notifications on eventFD.
-	sharedEventFDState *uint32
+	sharedEventFDState *atomicbitops.Uint32
 }
 
 // init initializes all state needed by the serverTx queue based on the
@@ -112,13 +112,13 @@ func (s *serverRx) cleanup() {
 // EnableNotification updates the shared state such that the peer will notify
 // the eventfd when there are packets to be dequeued.
 func (s *serverRx) EnableNotification() {
-	atomic.StoreUint32(s.sharedEventFDState, queue.EventFDEnabled)
+	s.sharedEventFDState.Store(queue.EventFDEnabled)
 }
 
 // DisableNotification updates the shared state such that the peer will not
 // notify the eventfd.
 func (s *serverRx) DisableNotification() {
-	atomic.StoreUint32(s.sharedEventFDState, queue.EventFDDisabled)
+	s.sharedEventFDState.Store(queue.EventFDDisabled)
 }
 
 // completionNotificationSize is size in bytes of a completion notification sent
@@ -126,23 +126,23 @@ func (s *serverRx) DisableNotification() {
 const completionNotificationSize = 8
 
 // receive receives a single packet from the packetPipe.
-func (s *serverRx) receive() []byte {
+func (s *serverRx) receive() *buffer.View {
 	desc := s.packetPipe.Pull()
 	if desc == nil {
 		return nil
 	}
 
 	pktInfo := queue.DecodeTxPacketHeader(desc)
-	contents := make([]byte, 0, pktInfo.Size)
+	contents := buffer.NewView(int(pktInfo.Size))
 	toCopy := pktInfo.Size
 	for i := 0; i < pktInfo.BufferCount; i++ {
 		txBuf := queue.DecodeTxBufferHeader(desc, i)
 		if txBuf.Size <= toCopy {
-			contents = append(contents, s.data[txBuf.Offset:][:txBuf.Size]...)
+			contents.Write(s.data[txBuf.Offset:][:txBuf.Size])
 			toCopy -= txBuf.Size
 			continue
 		}
-		contents = append(contents, s.data[txBuf.Offset:][:toCopy]...)
+		contents.Write(s.data[txBuf.Offset:][:toCopy])
 		break
 	}
 

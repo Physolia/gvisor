@@ -16,6 +16,7 @@ package lisafs
 
 import (
 	"fmt"
+	"io"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -54,24 +55,13 @@ func (f *ClientFD) Ok() bool {
 	return f.fd.Ok()
 }
 
-// CloseBatched queues this FD to be closed on the server and resets f.fd.
-// This maybe invoke the Close RPC if the queue is full.
-func (f *ClientFD) CloseBatched(ctx context.Context) {
-	f.client.CloseFDBatched(ctx, f.fd)
+// Close queues this FD to be closed on the server and resets f.fd.
+// This maybe invoke the Close RPC if the queue is full. If flush is true, then
+// the Close RPC is made immediately. Consider setting flush to false if
+// closing this FD on remote right away is not critical.
+func (f *ClientFD) Close(ctx context.Context, flush bool) {
+	f.client.CloseFD(ctx, f.fd, flush)
 	f.fd = InvalidFDID
-}
-
-// Close closes this FD immediately (invoking a Close RPC). Consider using
-// CloseBatched if closing this FD on remote right away is not critical.
-func (f *ClientFD) Close(ctx context.Context) error {
-	fdArr := [1]FDID{f.fd}
-	req := CloseReq{FDs: fdArr[:]}
-	var resp CloseResp
-
-	ctx.UninterruptibleSleepStart(false)
-	err := f.client.SndRcvMessage(Close, uint32(req.SizeBytes()), req.MarshalBytes, resp.CheckedUnmarshal, nil, req.String, resp.String)
-	ctx.UninterruptibleSleepFinish(false)
-	return err
 }
 
 // OpenAt makes the OpenAt RPC.
@@ -185,7 +175,19 @@ func (f *ClientFD) Read(ctx context.Context, dst []byte, offset uint64) (uint64,
 		ctx.UninterruptibleSleepStart(false)
 		err := f.client.SndRcvMessage(PRead, uint32(req.SizeBytes()), req.MarshalUnsafe, resp.CheckedUnmarshal, nil, req.String, resp.String)
 		ctx.UninterruptibleSleepFinish(false)
-		return uint64(resp.NumBytes), err
+		if err != nil {
+			return 0, err
+		}
+
+		// io.EOF is not an error that a lisafs server can return. Use POSIX
+		// semantics to return io.EOF manually: zero bytes were returned and a
+		// non-zero buffer was used.
+		// NOTE(b/237442794): Some callers like splice really depend on a non-nil
+		// error being returned in such a case. This is consistent with P9.
+		if resp.NumBytes == 0 && len(buf) > 0 {
+			return 0, io.EOF
+		}
+		return uint64(resp.NumBytes), nil
 	})
 }
 
@@ -302,7 +304,13 @@ func (f *ClientFD) SetStat(ctx context.Context, stat *linux.Statx) (uint32, erro
 	ctx.UninterruptibleSleepStart(false)
 	err := f.client.SndRcvMessage(SetStat, uint32(req.SizeBytes()), req.MarshalUnsafe, resp.CheckedUnmarshal, nil, req.String, resp.String)
 	ctx.UninterruptibleSleepFinish(false)
-	return resp.FailureMask, unix.Errno(resp.FailureErrNo), err
+	if err != nil {
+		return 0, nil, err
+	}
+	if resp.FailureMask == 0 {
+		return 0, nil, nil
+	}
+	return resp.FailureMask, unix.Errno(resp.FailureErrNo), nil
 }
 
 // WalkMultiple makes the Walk RPC with multiple path components.
@@ -345,7 +353,7 @@ func (f *ClientFD) Walk(ctx context.Context, name string) (Inode, error) {
 
 	if n := len(resp.Inodes); n > 1 {
 		for i := range resp.Inodes {
-			f.client.CloseFDBatched(ctx, resp.Inodes[i].ControlFD)
+			f.client.CloseFD(ctx, resp.Inodes[i].ControlFD, false /* flush */)
 		}
 		log.Warningf("requested to walk one component, but got %d results", n)
 		return Inode{}, unix.EIO
@@ -416,6 +424,46 @@ func (f *ClientFD) Flush(ctx context.Context) error {
 	err := f.client.SndRcvMessage(Flush, uint32(req.SizeBytes()), req.MarshalUnsafe, resp.CheckedUnmarshal, nil, req.String, resp.String)
 	ctx.UninterruptibleSleepFinish(false)
 	return err
+}
+
+// BindAt makes the BindAt RPC.
+func (f *ClientFD) BindAt(ctx context.Context, sockType linux.SockType, name string, mode linux.FileMode, uid UID, gid GID) (Inode, *ClientBoundSocketFD, error) {
+	var (
+		req          BindAtReq
+		resp         BindAtResp
+		hostSocketFD [1]int
+	)
+	req.DirFD = f.fd
+	req.SockType = primitive.Uint32(sockType)
+	req.Name = SizedString(name)
+	req.Mode = mode
+	req.UID = uid
+	req.GID = gid
+	ctx.UninterruptibleSleepStart(false)
+	err := f.client.SndRcvMessage(BindAt, uint32(req.SizeBytes()), req.MarshalBytes, resp.CheckedUnmarshal, hostSocketFD[:], req.String, resp.String)
+	ctx.UninterruptibleSleepFinish(false)
+	if err == nil && hostSocketFD[0] < 0 {
+		// No host socket fd? We can't proceed.
+		// Clean up any resources the gofer sent to us.
+		if resp.Child.ControlFD.Ok() {
+			f.client.CloseFD(ctx, resp.Child.ControlFD, false /* flush */)
+		}
+		if resp.BoundSocketFD.Ok() {
+			f.client.CloseFD(ctx, resp.BoundSocketFD, false /* flush */)
+		}
+		err = unix.EBADF
+	}
+	if err != nil {
+		return Inode{}, nil, err
+	}
+
+	cbsFD := &ClientBoundSocketFD{
+		fd:             resp.BoundSocketFD,
+		notificationFD: int32(hostSocketFD[0]),
+		client:         f.client,
+	}
+
+	return resp.Child, cbsFD, err
 }
 
 // Connect makes the Connect RPC.
@@ -531,4 +579,61 @@ func (f *ClientFD) RemoveXattr(ctx context.Context, name string) error {
 	err := f.client.SndRcvMessage(FRemoveXattr, uint32(req.SizeBytes()), req.MarshalBytes, resp.CheckedUnmarshal, nil, req.String, resp.String)
 	ctx.UninterruptibleSleepFinish(false)
 	return err
+}
+
+// ClientBoundSocketFD corresponds to a bound socket on the server. It
+// implements transport.BoundSocketFD.
+//
+// All fields are immutable.
+type ClientBoundSocketFD struct {
+	// fd is the FDID of the bound socket on the server.
+	fd FDID
+
+	// notificationFD is the host FD that can be used to notify when new
+	// clients connect to the socket.
+	notificationFD int32
+
+	client *Client
+}
+
+// Close implements transport.BoundSocketFD.Close.
+func (f *ClientBoundSocketFD) Close(ctx context.Context) {
+	_ = unix.Close(int(f.notificationFD))
+	// flush is true because the socket FD must be closed immediately on the
+	// server. close(2) on socket FD impacts application behavior.
+	f.client.CloseFD(ctx, f.fd, true /* flush */)
+}
+
+// NotificationFD implements transport.BoundSocketFD.NotificationFD.
+func (f *ClientBoundSocketFD) NotificationFD() int32 {
+	return f.notificationFD
+}
+
+// Listen implements transport.BoundSocketFD.Listen.
+func (f *ClientBoundSocketFD) Listen(ctx context.Context, backlog int32) error {
+	req := ListenReq{
+		FD:      f.fd,
+		Backlog: backlog,
+	}
+	var resp ListenResp
+	ctx.UninterruptibleSleepStart(false)
+	err := f.client.SndRcvMessage(Listen, uint32(req.SizeBytes()), req.MarshalBytes, resp.CheckedUnmarshal, nil, req.String, resp.String)
+	ctx.UninterruptibleSleepFinish(false)
+	return err
+}
+
+// Accept implements transport.BoundSocketFD.Accept.
+func (f *ClientBoundSocketFD) Accept(ctx context.Context) (int, error) {
+	req := AcceptReq{
+		FD: f.fd,
+	}
+	var resp AcceptResp
+	var hostSocketFD [1]int
+	ctx.UninterruptibleSleepStart(false)
+	err := f.client.SndRcvMessage(Accept, uint32(req.SizeBytes()), req.MarshalBytes, resp.CheckedUnmarshal, hostSocketFD[:], req.String, resp.String)
+	ctx.UninterruptibleSleepFinish(false)
+	if err == nil && hostSocketFD[0] < 0 {
+		err = unix.EBADF
+	}
+	return hostSocketFD[0], err
 }

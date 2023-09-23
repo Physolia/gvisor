@@ -171,7 +171,7 @@ func (s *fileRefcountSet) afterLoad() {}
 
 // +checklocksignore
 func (s *fileRefcountSet) StateLoad(stateSourceObject state.Source) {
-	stateSourceObject.LoadValue(0, new(*fileRefcountSegmentDataSlices), func(y interface{}) { s.loadRoot(y.(*fileRefcountSegmentDataSlices)) })
+	stateSourceObject.LoadValue(0, new(*fileRefcountSegmentDataSlices), func(y any) { s.loadRoot(y.(*fileRefcountSegmentDataSlices)) })
 }
 
 func (n *fileRefcountnode) StateTypeName() string {
@@ -327,11 +327,11 @@ func (mm *MemoryManager) StateFields() []string {
 		"pmas",
 		"curRSS",
 		"maxRSS",
+		"dumpability",
 		"argv",
 		"envv",
 		"auxv",
 		"executable",
-		"dumpability",
 		"aioManager",
 		"sleepForActivation",
 		"vdsoSigReturnAddr",
@@ -363,11 +363,11 @@ func (mm *MemoryManager) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(11, &mm.pmas)
 	stateSinkObject.Save(12, &mm.curRSS)
 	stateSinkObject.Save(13, &mm.maxRSS)
-	stateSinkObject.Save(14, &mm.argv)
-	stateSinkObject.Save(15, &mm.envv)
-	stateSinkObject.Save(16, &mm.auxv)
-	stateSinkObject.Save(17, &mm.executable)
-	stateSinkObject.Save(18, &mm.dumpability)
+	stateSinkObject.Save(14, &mm.dumpability)
+	stateSinkObject.Save(15, &mm.argv)
+	stateSinkObject.Save(16, &mm.envv)
+	stateSinkObject.Save(17, &mm.auxv)
+	stateSinkObject.Save(18, &mm.executable)
 	stateSinkObject.Save(19, &mm.aioManager)
 	stateSinkObject.Save(20, &mm.sleepForActivation)
 	stateSinkObject.Save(21, &mm.vdsoSigReturnAddr)
@@ -391,11 +391,11 @@ func (mm *MemoryManager) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(11, &mm.pmas)
 	stateSourceObject.Load(12, &mm.curRSS)
 	stateSourceObject.Load(13, &mm.maxRSS)
-	stateSourceObject.Load(14, &mm.argv)
-	stateSourceObject.Load(15, &mm.envv)
-	stateSourceObject.Load(16, &mm.auxv)
-	stateSourceObject.Load(17, &mm.executable)
-	stateSourceObject.Load(18, &mm.dumpability)
+	stateSourceObject.Load(14, &mm.dumpability)
+	stateSourceObject.Load(15, &mm.argv)
+	stateSourceObject.Load(16, &mm.envv)
+	stateSourceObject.Load(17, &mm.auxv)
+	stateSourceObject.Load(18, &mm.executable)
 	stateSourceObject.Load(19, &mm.aioManager)
 	stateSourceObject.Load(20, &mm.sleepForActivation)
 	stateSourceObject.Load(21, &mm.vdsoSigReturnAddr)
@@ -455,7 +455,7 @@ func (v *vma) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(7, &v.id)
 	stateSourceObject.Load(8, &v.hint)
 	stateSourceObject.Load(9, &v.lastFault)
-	stateSourceObject.LoadValue(2, new(int), func(y interface{}) { v.loadRealPerms(y.(int)) })
+	stateSourceObject.LoadValue(2, new(int), func(y any) { v.loadRealPerms(y.(int)) })
 }
 
 func (p *pma) StateTypeName() string {
@@ -547,7 +547,7 @@ func (s *pmaSet) afterLoad() {}
 
 // +checklocksignore
 func (s *pmaSet) StateLoad(stateSourceObject state.Source) {
-	stateSourceObject.LoadValue(0, new(*pmaSegmentDataSlices), func(y interface{}) { s.loadRoot(y.(*pmaSegmentDataSlices)) })
+	stateSourceObject.LoadValue(0, new(*pmaSegmentDataSlices), func(y any) { s.loadRoot(y.(*pmaSegmentDataSlices)) })
 }
 
 func (n *pmanode) StateTypeName() string {
@@ -709,7 +709,7 @@ func (s *vmaSet) afterLoad() {}
 
 // +checklocksignore
 func (s *vmaSet) StateLoad(stateSourceObject state.Source) {
-	stateSourceObject.LoadValue(0, new(*vmaSegmentDataSlices), func(y interface{}) { s.loadRoot(y.(*vmaSegmentDataSlices)) })
+	stateSourceObject.LoadValue(0, new(*vmaSegmentDataSlices), func(y any) { s.loadRoot(y.(*vmaSegmentDataSlices)) })
 }
 
 func (n *vmanode) StateTypeName() string {

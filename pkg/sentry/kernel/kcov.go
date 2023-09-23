@@ -79,7 +79,7 @@ func (k *Kernel) NewKcov() *Kcov {
 }
 
 var coveragePool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return make([]byte, 0)
 	},
 }
@@ -242,7 +242,11 @@ func (kcov *Kcov) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) erro
 
 	if kcov.mappable == nil {
 		// Set up the kcov area.
-		fr, err := kcov.mfp.MemoryFile().Allocate(kcov.size*8, pgalloc.AllocOpts{Kind: usage.Anonymous})
+		opts := pgalloc.AllocOpts{
+			Kind:    usage.Anonymous,
+			MemCgID: pgalloc.MemoryCgroupIDFromContext(ctx),
+		}
+		fr, err := kcov.mfp.MemoryFile().Allocate(kcov.size*8, opts)
 		if err != nil {
 			return err
 		}

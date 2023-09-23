@@ -4,18 +4,18 @@ import (
 	"fmt"
 
 	"gvisor.dev/gvisor/pkg/atomicbitops"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
+	"gvisor.dev/gvisor/pkg/refs"
 )
 
 // enableLogging indicates whether reference-related events should be logged (with
 // stack traces). This is false by default and should only be set to true for
 // debugging purposes, as it can generate an extremely large amount of output
 // and drastically degrade performance.
-const socketOperationsenableLogging = false
+const socketenableLogging = false
 
 // obj is used to customize logging. Note that we use a pointer to T so that
 // we do not copy the entire object when passed as a format parameter.
-var socketOperationsobj *SocketOperations
+var socketobj *Socket
 
 // Refs implements refs.RefCounter. It keeps a reference count using atomic
 // operations and calls the destructor when the count reaches zero.
@@ -29,7 +29,7 @@ var socketOperationsobj *SocketOperations
 // interfaces manually.
 //
 // +stateify savable
-type socketOperationsRefs struct {
+type socketRefs struct {
 	// refCount is composed of two fields:
 	//
 	//	[32-bit speculative references]:[32-bit real references]
@@ -42,39 +42,40 @@ type socketOperationsRefs struct {
 
 // InitRefs initializes r with one reference and, if enabled, activates leak
 // checking.
-func (r *socketOperationsRefs) InitRefs() {
-	r.refCount.Store(1)
-	refsvfs2.Register(r)
+func (r *socketRefs) InitRefs() {
+
+	r.refCount.RacyStore(1)
+	refs.Register(r)
 }
 
-// RefType implements refsvfs2.CheckedObject.RefType.
-func (r *socketOperationsRefs) RefType() string {
-	return fmt.Sprintf("%T", socketOperationsobj)[1:]
+// RefType implements refs.CheckedObject.RefType.
+func (r *socketRefs) RefType() string {
+	return fmt.Sprintf("%T", socketobj)[1:]
 }
 
-// LeakMessage implements refsvfs2.CheckedObject.LeakMessage.
-func (r *socketOperationsRefs) LeakMessage() string {
+// LeakMessage implements refs.CheckedObject.LeakMessage.
+func (r *socketRefs) LeakMessage() string {
 	return fmt.Sprintf("[%s %p] reference count of %d instead of 0", r.RefType(), r, r.ReadRefs())
 }
 
-// LogRefs implements refsvfs2.CheckedObject.LogRefs.
-func (r *socketOperationsRefs) LogRefs() bool {
-	return socketOperationsenableLogging
+// LogRefs implements refs.CheckedObject.LogRefs.
+func (r *socketRefs) LogRefs() bool {
+	return socketenableLogging
 }
 
 // ReadRefs returns the current number of references. The returned count is
 // inherently racy and is unsafe to use without external synchronization.
-func (r *socketOperationsRefs) ReadRefs() int64 {
+func (r *socketRefs) ReadRefs() int64 {
 	return r.refCount.Load()
 }
 
 // IncRef implements refs.RefCounter.IncRef.
 //
 //go:nosplit
-func (r *socketOperationsRefs) IncRef() {
+func (r *socketRefs) IncRef() {
 	v := r.refCount.Add(1)
-	if socketOperationsenableLogging {
-		refsvfs2.LogIncRef(r, v)
+	if socketenableLogging {
+		refs.LogIncRef(r, v)
 	}
 	if v <= 1 {
 		panic(fmt.Sprintf("Incrementing non-positive count %p on %s", r, r.RefType()))
@@ -88,7 +89,7 @@ func (r *socketOperationsRefs) IncRef() {
 // other TryIncRef calls from genuine references held.
 //
 //go:nosplit
-func (r *socketOperationsRefs) TryIncRef() bool {
+func (r *socketRefs) TryIncRef() bool {
 	const speculativeRef = 1 << 32
 	if v := r.refCount.Add(speculativeRef); int32(v) == 0 {
 
@@ -97,8 +98,8 @@ func (r *socketOperationsRefs) TryIncRef() bool {
 	}
 
 	v := r.refCount.Add(-speculativeRef + 1)
-	if socketOperationsenableLogging {
-		refsvfs2.LogTryIncRef(r, v)
+	if socketenableLogging {
+		refs.LogTryIncRef(r, v)
 	}
 	return true
 }
@@ -115,17 +116,17 @@ func (r *socketOperationsRefs) TryIncRef() bool {
 //	A: TryIncRef [transform speculative to real]
 //
 //go:nosplit
-func (r *socketOperationsRefs) DecRef(destroy func()) {
+func (r *socketRefs) DecRef(destroy func()) {
 	v := r.refCount.Add(-1)
-	if socketOperationsenableLogging {
-		refsvfs2.LogDecRef(r, v)
+	if socketenableLogging {
+		refs.LogDecRef(r, v)
 	}
 	switch {
 	case v < 0:
 		panic(fmt.Sprintf("Decrementing non-positive ref count %p, owned by %s", r, r.RefType()))
 
 	case v == 0:
-		refsvfs2.Unregister(r)
+		refs.Unregister(r)
 
 		if destroy != nil {
 			destroy()
@@ -133,8 +134,8 @@ func (r *socketOperationsRefs) DecRef(destroy func()) {
 	}
 }
 
-func (r *socketOperationsRefs) afterLoad() {
+func (r *socketRefs) afterLoad() {
 	if r.ReadRefs() > 0 {
-		refsvfs2.Register(r)
+		refs.Register(r)
 	}
 }

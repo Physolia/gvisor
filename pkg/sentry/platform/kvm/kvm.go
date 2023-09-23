@@ -67,6 +67,8 @@ type KVM struct {
 	// KVM never changes mm_structs.
 	platform.UseHostProcessMemoryBarrier
 
+	platform.DoesOwnPageTables
+
 	// machine is the backing VM.
 	machine *machine
 }
@@ -107,7 +109,7 @@ func New(deviceFile *os.File) (*KVM, error) {
 		errno unix.Errno
 	)
 	for {
-		vm, _, errno = unix.Syscall(unix.SYS_IOCTL, fd, _KVM_CREATE_VM, 0)
+		vm, _, errno = unix.Syscall(unix.SYS_IOCTL, fd, KVM_CREATE_VM, 0)
 		if errno == unix.EINTR {
 			continue
 		}
@@ -161,7 +163,7 @@ func (*KVM) MaxUserAddress() hostarch.Addr {
 }
 
 // NewAddressSpace returns a new pagetable root.
-func (k *KVM) NewAddressSpace(interface{}) (platform.AddressSpace, <-chan struct{}, error) {
+func (k *KVM) NewAddressSpace(any) (platform.AddressSpace, <-chan struct{}, error) {
 	// Allocate page tables and install system mappings.
 	pageTables := pagetables.NewWithUpper(newAllocator(), k.machine.upperSharedPageTables, ring0.KernelStartAddress)
 

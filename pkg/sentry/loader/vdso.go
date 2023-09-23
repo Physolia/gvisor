@@ -42,7 +42,7 @@ type fileContext struct {
 	context.Context
 }
 
-func (f *fileContext) Value(key interface{}) interface{} {
+func (f *fileContext) Value(key any) any {
 	switch key {
 	case uniqueid.CtxGlobalUniqueID:
 		return uint64(0)
@@ -55,6 +55,7 @@ type byteFullReader struct {
 	data []byte
 }
 
+// ReadFull implements fullReader.ReadFull.
 func (b *byteFullReader) ReadFull(ctx context.Context, dst usermem.IOSequence, offset int64) (int64, error) {
 	if offset < 0 {
 		return 0, linuxerr.EINVAL
@@ -73,12 +74,12 @@ func (b *byteFullReader) ReadFull(ctx context.Context, dst usermem.IOSequence, o
 // segments have the same layout in the ELF as they expect to have in memory.
 //
 // Namely, this means that we must verify:
-// * PT_LOAD file offsets are equivalent to the memory offset from the first
-//   segment.
-// * No extra zeroed space (memsz) is required.
-// * PT_LOAD segments are in order.
-// * No two PT_LOAD segments occupy parts of the same page.
-// * PT_LOAD segments don't extend beyond the end of the file.
+//   - PT_LOAD file offsets are equivalent to the memory offset from the first
+//     segment.
+//   - No extra zeroed space (memsz) is required.
+//   - PT_LOAD segments are in order.
+//   - No two PT_LOAD segments occupy parts of the same page.
+//   - PT_LOAD segments don't extend beyond the end of the file.
 //
 // ctx may be nil if f does not need it.
 func validateVDSO(ctx context.Context, f fullReader, size uint64) (elfInfo, error) {

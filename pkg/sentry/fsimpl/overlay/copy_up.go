@@ -16,7 +16,6 @@ package overlay
 
 import (
 	"fmt"
-	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
@@ -29,7 +28,19 @@ import (
 )
 
 func (d *dentry) isCopiedUp() bool {
-	return atomic.LoadUint32(&d.copiedUp) != 0
+	return d.copiedUp.Load() != 0
+}
+
+func (d *dentry) canBeCopiedUp() bool {
+	ftype := d.mode.Load() & linux.S_IFMT
+	switch ftype {
+	case linux.S_IFREG, linux.S_IFDIR, linux.S_IFLNK, linux.S_IFBLK, linux.S_IFCHR:
+		// Can be copied-up.
+		return true
+	default:
+		// Can't be copied-up.
+		return false
+	}
 }
 
 // copyUpLocked ensures that d exists on the upper layer, i.e. d.upperVD.Ok().
@@ -49,12 +60,7 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 	// credentials from context rather an take an explicit creds parameter.
 	ctx = auth.ContextWithCredentials(ctx, d.fs.creds)
 
-	ftype := atomic.LoadUint32(&d.mode) & linux.S_IFMT
-	switch ftype {
-	case linux.S_IFREG, linux.S_IFDIR, linux.S_IFLNK, linux.S_IFBLK, linux.S_IFCHR:
-		// Can be copied-up.
-	default:
-		// Can't be copied-up.
+	if !d.canBeCopiedUp() {
 		return linuxerr.EPERM
 	}
 
@@ -93,6 +99,7 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 	}
 
 	// Perform copy-up.
+	ftype := d.mode.Load() & linux.S_IFMT
 	newpop := vfs.PathOperation{
 		Root:  d.parent.upperVD,
 		Start: d.parent.upperVD,
@@ -126,7 +133,8 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 		defer oldFD.DecRef(ctx)
 		newFD, err := vfsObj.OpenAt(ctx, d.fs.creds, &newpop, &vfs.OpenOptions{
 			Flags: linux.O_WRONLY | linux.O_CREAT | linux.O_EXCL,
-			Mode:  linux.FileMode(d.mode &^ linux.S_IFMT),
+			// d.mode can be read because d.copyMu is locked.
+			Mode: linux.FileMode(d.mode.RacyLoad() &^ linux.S_IFMT),
 		})
 		if err != nil {
 			return err
@@ -136,8 +144,6 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 			cleanupUndoCopyUp()
 			return err
 		}
-		d.mapsMu.Lock()
-		defer d.mapsMu.Unlock()
 		if d.wrappedMappable != nil {
 			// We may have memory mappings of the file on the lower layer.
 			// Switch to mapping the file on the upper layer instead.
@@ -157,9 +163,10 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 		}
 		if err := newFD.SetStat(ctx, vfs.SetStatOptions{
 			Stat: linux.Statx{
-				Mask:  linux.STATX_UID | linux.STATX_GID | oldStat.Mask&timestampsMask,
-				UID:   d.uid,
-				GID:   d.gid,
+				Mask: linux.STATX_UID | linux.STATX_GID | oldStat.Mask&timestampsMask,
+				// d.uid and d.gid can be read because d.copyMu is locked.
+				UID:   d.uid.RacyLoad(),
+				GID:   d.gid.RacyLoad(),
 				Atime: oldStat.Atime,
 				Mtime: oldStat.Mtime,
 			},
@@ -172,16 +179,18 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 
 	case linux.S_IFDIR:
 		if err := vfsObj.MkdirAt(ctx, d.fs.creds, &newpop, &vfs.MkdirOptions{
-			Mode:                   linux.FileMode(d.mode &^ linux.S_IFMT),
+			// d.mode can be read because d.copyMu is locked.
+			Mode:                   linux.FileMode(d.mode.RacyLoad() &^ linux.S_IFMT),
 			ForSyntheticMountpoint: forSyntheticMountpoint,
 		}); err != nil {
 			return err
 		}
 		if err := vfsObj.SetStatAt(ctx, d.fs.creds, &newpop, &vfs.SetStatOptions{
 			Stat: linux.Statx{
-				Mask:  linux.STATX_UID | linux.STATX_GID | oldStat.Mask&timestampsMask,
-				UID:   d.uid,
-				GID:   d.gid,
+				Mask: linux.STATX_UID | linux.STATX_GID | oldStat.Mask&timestampsMask,
+				// d.uid and d.gid can be read because d.copyMu is locked.
+				UID:   d.uid.RacyLoad(),
+				GID:   d.gid.RacyLoad(),
 				Atime: oldStat.Atime,
 				Mtime: oldStat.Mtime,
 			},
@@ -206,10 +215,11 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 		}
 		if err := vfsObj.SetStatAt(ctx, d.fs.creds, &newpop, &vfs.SetStatOptions{
 			Stat: linux.Statx{
-				Mask:  linux.STATX_MODE | linux.STATX_UID | linux.STATX_GID | oldStat.Mask&timestampsMask,
-				Mode:  uint16(d.mode),
-				UID:   d.uid,
-				GID:   d.gid,
+				Mask: linux.STATX_MODE | linux.STATX_UID | linux.STATX_GID | oldStat.Mask&timestampsMask,
+				// d.{uid,gid,mode} can be read because d.copyMu is locked.
+				Mode:  uint16(d.mode.RacyLoad()),
+				UID:   d.uid.RacyLoad(),
+				GID:   d.gid.RacyLoad(),
 				Atime: oldStat.Atime,
 				Mtime: oldStat.Mtime,
 			},
@@ -226,7 +236,8 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 
 	case linux.S_IFBLK, linux.S_IFCHR:
 		if err := vfsObj.MknodAt(ctx, d.fs.creds, &newpop, &vfs.MknodOptions{
-			Mode:     linux.FileMode(d.mode),
+			// d.mode can be read because d.copyMu is locked.
+			Mode:     linux.FileMode(d.mode.RacyLoad()),
 			DevMajor: oldStat.RdevMajor,
 			DevMinor: oldStat.RdevMinor,
 		}); err != nil {
@@ -234,9 +245,10 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 		}
 		if err := vfsObj.SetStatAt(ctx, d.fs.creds, &newpop, &vfs.SetStatOptions{
 			Stat: linux.Statx{
-				Mask:  linux.STATX_UID | linux.STATX_GID | oldStat.Mask&timestampsMask,
-				UID:   d.uid,
-				GID:   d.gid,
+				Mask: linux.STATX_UID | linux.STATX_GID | oldStat.Mask&timestampsMask,
+				// d.uid and d.gid can be read because d.copyMu is locked.
+				UID:   d.uid.RacyLoad(),
+				GID:   d.gid.RacyLoad(),
 				Atime: oldStat.Atime,
 				Mtime: oldStat.Mtime,
 			},
@@ -278,14 +290,21 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 			cleanupUndoCopyUp()
 			return linuxerr.EREMOTE
 		}
-		atomic.StoreUint32(&d.devMajor, upperStat.DevMajor)
-		atomic.StoreUint32(&d.devMinor, upperStat.DevMinor)
+		d.devMajor.Store(upperStat.DevMajor)
+		d.devMinor.Store(upperStat.DevMinor)
 		d.ino.Store(upperStat.Ino)
+
+		// Lower level dentries for non-directories are no longer accessible from
+		// the overlayfs anymore after copyup. Ask filesystems to release their
+		// resources whenever possible.
+		for _, lowerDentry := range d.lowerVDs {
+			lowerDentry.Dentry().MarkEvictable()
+		}
 	}
 
 	if mmapOpts != nil && mmapOpts.Mappable != nil {
-		// Note that if mmapOpts != nil, then d.mapsMu is locked for writing
-		// (from the S_IFREG path above).
+		d.mapsMu.Lock()
+		defer d.mapsMu.Unlock()
 
 		// Propagate mappings of d to the new Mappable. Remember which mappings
 		// we added so we can remove them on failure.
@@ -313,17 +332,17 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 		// Switch to the new Mappable. We do this at the end of copy-up
 		// because:
 		//
-		// - We need to switch Mappables (by changing d.wrappedMappable) before
-		// invalidating Translations from the old Mappable (to pick up
-		// Translations from the new one).
+		//	- We need to switch Mappables (by changing d.wrappedMappable) before
+		//		invalidating Translations from the old Mappable (to pick up
+		//		Translations from the new one).
 		//
-		// - We need to lock d.dataMu while changing d.wrappedMappable, but
-		// must invalidate Translations with d.dataMu unlocked (due to lock
-		// ordering).
+		//	- We need to lock d.dataMu while changing d.wrappedMappable, but
+		//		must invalidate Translations with d.dataMu unlocked (due to lock
+		//		ordering).
 		//
-		// - Consequently, once we unlock d.dataMu, other threads may
-		// immediately observe the new (copied-up) Mappable, which we want to
-		// delay until copy-up is guaranteed to succeed.
+		//	- Consequently, once we unlock d.dataMu, other threads may
+		//		immediately observe the new (copied-up) Mappable, which we want to
+		//		delay until copy-up is guaranteed to succeed.
 		d.dataMu.Lock()
 		lowerMappable := d.wrappedMappable
 		d.wrappedMappable = upperMappable
@@ -339,7 +358,7 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 		d.lowerMappings.RemoveAll()
 	}
 
-	atomic.StoreUint32(&d.copiedUp, 1)
+	d.copiedUp.Store(1)
 	return nil
 }
 
@@ -385,9 +404,9 @@ func (d *dentry) copyXattrsLocked(ctx context.Context) error {
 // copyUpDescendantsLocked ensures that all descendants of d are copied up.
 //
 // Preconditions:
-// * filesystem.renameMu must be locked.
-// * d.dirMu must be locked.
-// * d.isDir().
+//   - filesystem.renameMu must be locked.
+//   - d.dirMu must be locked.
+//   - d.isDir().
 func (d *dentry) copyUpDescendantsLocked(ctx context.Context, ds **[]*dentry) error {
 	dirents, err := d.getDirentsLocked(ctx)
 	if err != nil {

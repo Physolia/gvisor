@@ -24,6 +24,8 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -84,9 +86,9 @@ func (c *controllerCommon) Enabled() bool {
 	return true
 }
 
-// RootCgroup implements kernel.CgroupController.RootCgroup.
-func (c *controllerCommon) RootCgroup() kernel.Cgroup {
-	return c.fs.rootCgroup()
+// EffectiveRootCgroup implements kernel.CgroupController.EffectiveRootCgroup.
+func (c *controllerCommon) EffectiveRootCgroup() kernel.Cgroup {
+	return c.fs.effectiveRootCgroup()
 }
 
 // controller is an interface for common functionality related to all cgroups.
@@ -138,6 +140,10 @@ type controller interface {
 	//
 	// Precondition: Caller must call a corresponding PrepareMigrate.
 	AbortMigrate(t *kernel.Task, src controller)
+
+	// Charge charges a controller for a particular resource. The implementation
+	// should panic if passed a resource type they do not control.
+	Charge(t *kernel.Task, d *kernfs.Dentry, res kernel.CgroupResourceType, value int64) error
 }
 
 // cgroupInode implements kernel.CgroupImpl and kernfs.Inode.
@@ -145,6 +151,9 @@ type controller interface {
 // +stateify savable
 type cgroupInode struct {
 	dir
+
+	// id is the id of this cgroup.
+	id uint32
 
 	// controllers is the set of controllers for this cgroup. This is used to
 	// store controller-specific state per cgroup. The set of controllers should
@@ -170,9 +179,19 @@ func (fs *filesystem) newCgroupInode(ctx context.Context, creds *auth.Credential
 	}
 	c.dir.cgi = c
 
+	k := kernel.KernelFromContext(ctx)
+	r := k.CgroupRegistry()
+	// Assign id for the cgroup.
+	cid, err := r.NextCgroupID()
+	if err != nil {
+		log.Warningf("cgroupfs newCgroupInode: Failed to assign id to the cgroup: %v", err)
+	}
+	c.id = cid
+	r.AddCgroup(c)
+
 	contents := make(map[string]kernfs.Inode)
-	contents["cgroup.procs"] = fs.newControllerFile(ctx, creds, &cgroupProcsData{c})
-	contents["tasks"] = fs.newControllerFile(ctx, creds, &tasksData{c})
+	contents["cgroup.procs"] = fs.newControllerWritableFile(ctx, creds, &cgroupProcsData{c}, false)
+	contents["tasks"] = fs.newControllerWritableFile(ctx, creds, &tasksData{c}, false)
 
 	if parent != nil {
 		for ty, ctl := range parent.controllers {
@@ -182,10 +201,11 @@ func (fs *filesystem) newCgroupInode(ctx context.Context, creds *auth.Credential
 		}
 	} else {
 		for _, ctl := range fs.controllers {
-			new := ctl.Clone()
-			// Uniqueness of controllers enforced by the filesystem on creation.
-			c.controllers[ctl.Type()] = new
-			new.AddControlFiles(ctx, creds, c, contents)
+			// Uniqueness of controllers enforced by the filesystem on
+			// creation. The root cgroup uses the controllers directly from the
+			// filesystem.
+			c.controllers[ctl.Type()] = ctl
+			ctl.AddControlFiles(ctx, creds, c, contents)
 		}
 	}
 
@@ -198,8 +218,14 @@ func (fs *filesystem) newCgroupInode(ctx context.Context, creds *auth.Credential
 	return c
 }
 
+// HierarchyID implements kernel.CgroupImpl.HierarchyID.
 func (c *cgroupInode) HierarchyID() uint32 {
 	return c.fs.hierarchyID
+}
+
+// Name implements kernel.CgroupImpl.Name.
+func (c *cgroupInode) Name() string {
+	return c.fs.hierarchyName
 }
 
 // Controllers implements kernel.CgroupImpl.Controllers.
@@ -282,6 +308,7 @@ func (c *cgroupInode) AbortMigrate(t *kernel.Task, src *kernel.Cgroup) {
 	}
 }
 
+// CgroupFromControlFileFD returns a cgroup object given a control file FD for the cgroup.
 func (c *cgroupInode) CgroupFromControlFileFD(fd *vfs.FileDescription) kernel.Cgroup {
 	controlFileDentry := fd.Dentry().Impl().(*kernfs.Dentry)
 	// The returned parent dentry remains valid without holding locks because in
@@ -293,6 +320,79 @@ func (c *cgroupInode) CgroupFromControlFileFD(fd *vfs.FileDescription) kernel.Cg
 		Dentry:     parentD,
 		CgroupImpl: c,
 	}
+}
+
+// Charge implements kernel.CgroupImpl.Charge.
+//
+// Charge notifies a matching controller of a change in resource usage. Due to
+// the uniqueness of controllers, at most one controller will match. If no
+// matching controller is present in this directory, the call silently
+// succeeds. The caller should call Charge on all hierarchies to ensure any
+// matching controller across the entire system is charged.
+func (c *cgroupInode) Charge(t *kernel.Task, d *kernfs.Dentry, ctlType kernel.CgroupControllerType, res kernel.CgroupResourceType, value int64) error {
+	c.fs.tasksMu.RLock()
+	defer c.fs.tasksMu.RUnlock()
+	if ctl, ok := c.controllers[ctlType]; ok {
+		return ctl.Charge(t, d, res, value)
+	}
+	return nil
+}
+
+// ReadControl implements kernel.CgroupImpl.ReadControl.
+func (c *cgroupInode) ReadControl(ctx context.Context, name string) (string, error) {
+	cfi, err := c.Lookup(ctx, name)
+	if err != nil {
+		return "", fmt.Errorf("no such control file")
+	}
+	cbf, ok := cfi.(controllerFileImpl)
+	if !ok {
+		return "", fmt.Errorf("no such control file")
+	}
+	if !cbf.AllowBackgroundAccess() {
+		return "", fmt.Errorf("this control may not be accessed from a background context")
+	}
+
+	var buf bytes.Buffer
+	err = cbf.Source().Data().Generate(ctx, &buf)
+	return buf.String(), err
+}
+
+// WriteControl implements kernel.CgroupImpl.WriteControl.
+func (c *cgroupInode) WriteControl(ctx context.Context, name string, value string) error {
+	cfi, err := c.Lookup(ctx, name)
+	if err != nil {
+		return fmt.Errorf("no such control file")
+	}
+	// Do the more general cast first so we can give a meaningful error message when
+	// the control file exists, but isn't accessible (either due to being
+	// unwritable, or not being available from a background context).
+	cbf, ok := cfi.(controllerFileImpl)
+	if !ok {
+		return fmt.Errorf("no such control file")
+	}
+	if !cbf.AllowBackgroundAccess() {
+		return fmt.Errorf("this control may not be accessed from a background context")
+	}
+	wcbf, ok := cfi.(writableControllerFileImpl)
+	if !ok {
+		return fmt.Errorf("control file not writable")
+	}
+
+	ioSeq := usermem.BytesIOSequence([]byte(value))
+	n, err := wcbf.WriteBackground(ctx, ioSeq)
+	if err != nil {
+		return err
+	}
+	if n != int64(len(value)) {
+		return fmt.Errorf("short write")
+	}
+
+	return nil
+}
+
+// ID implements kernel.CgroupImpl.ID.
+func (c *cgroupInode) ID() uint32 {
+	return c.id
 }
 
 func sortTIDs(tids []kernel.ThreadID) {
@@ -320,7 +420,7 @@ func (d *cgroupProcsData) Generate(ctx context.Context, buf *bytes.Buffer) error
 	}
 
 	pgidList := make([]kernel.ThreadID, 0, len(pgids))
-	for pgid, _ := range pgids {
+	for pgid := range pgids {
 		pgidList = append(pgidList, pgid)
 	}
 	sortTIDs(pgidList)
@@ -341,7 +441,13 @@ func (d *cgroupProcsData) Write(ctx context.Context, fd *vfs.FileDescription, sr
 
 	t := kernel.TaskFromContext(ctx)
 	currPidns := t.ThreadGroup().PIDNamespace()
-	targetTG := currPidns.ThreadGroupWithID(kernel.ThreadID(tgid))
+	var targetTG *kernel.ThreadGroup
+	if tgid != 0 {
+		targetTG = currPidns.ThreadGroupWithID(kernel.ThreadID(tgid))
+	} else {
+		targetTG = t.ThreadGroup()
+	}
+
 	if targetTG == nil {
 		return 0, linuxerr.EINVAL
 	}
@@ -383,7 +489,12 @@ func (d *tasksData) Write(ctx context.Context, fd *vfs.FileDescription, src user
 
 	t := kernel.TaskFromContext(ctx)
 	currPidns := t.ThreadGroup().PIDNamespace()
-	targetTask := currPidns.TaskWithID(kernel.ThreadID(tid))
+	var targetTask *kernel.Task
+	if tid != 0 {
+		targetTask = currPidns.TaskWithID(kernel.ThreadID(tid))
+	} else {
+		targetTask = t
+	}
 	if targetTask == nil {
 		return 0, linuxerr.EINVAL
 	}
@@ -395,9 +506,7 @@ func (d *tasksData) Write(ctx context.Context, fd *vfs.FileDescription, src user
 func parseInt64FromString(ctx context.Context, src usermem.IOSequence) (val, len int64, err error) {
 	const maxInt64StrLen = 20 // i.e. len(fmt.Sprintf("%d", math.MinInt64)) == 20
 
-	t := kernel.TaskFromContext(ctx)
-
-	buf := t.CopyScratchBuffer(maxInt64StrLen)
+	buf := copyScratchBufferFromContext(ctx, maxInt64StrLen)
 	n, err := src.CopyIn(ctx, buf)
 	if err != nil {
 		return 0, int64(n), err
@@ -413,6 +522,18 @@ func parseInt64FromString(ctx context.Context, src usermem.IOSequence) (val, len
 	}
 
 	return val, int64(n), nil
+}
+
+// copyScratchBufferFromContext returns a scratch buffer of the given size. It
+// tries to use the task's copy scratch buffer if we're on a task context,
+// otherwise it allocates a new buffer.
+func copyScratchBufferFromContext(ctx context.Context, size int) []byte {
+	t := kernel.TaskFromContext(ctx)
+	if t != nil {
+		return t.CopyScratchBuffer(hostarch.PageSize)
+	}
+	// Not on task context.
+	return make([]byte, hostarch.PageSize)
 }
 
 // controllerStateless partially implements controller. It stubs the migration
@@ -435,3 +556,13 @@ func (*controllerStateless) CommitMigrate(t *kernel.Task, src controller) {}
 
 // AbortMigrate implements controller.AbortMigrate.
 func (*controllerStateless) AbortMigrate(t *kernel.Task, src controller) {}
+
+// controllerNoResource partially implements controller. It stubs out the Charge
+// method for controllers that don't track resource usage through the charge
+// mechanism.
+type controllerNoResource struct{}
+
+// Charge implements controller.Charge.
+func (*controllerNoResource) Charge(t *kernel.Task, d *kernfs.Dentry, res kernel.CgroupResourceType, value int64) error {
+	panic(fmt.Sprintf("cgroupfs: Attempted to charge a controller with unknown resource %v for value %v", res, value))
+}

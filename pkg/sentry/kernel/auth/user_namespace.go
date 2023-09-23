@@ -18,7 +18,6 @@ import (
 	"math"
 
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
-	"gvisor.dev/gvisor/pkg/sync"
 )
 
 // A UserNamespace represents a user namespace. See user_namespaces(7) for
@@ -34,11 +33,14 @@ type UserNamespace struct {
 	// namespace. owner is immutable.
 	owner KUID
 
+	// Keys is the set of keys in this namespace.
+	Keys KeySet
+
 	// mu protects the following fields.
 	//
 	// If mu will be locked in multiple UserNamespaces, it must be locked in
 	// descendant namespaces before ancestors.
-	mu sync.Mutex `state:"nosave"`
+	mu userNamespaceMutex `state:"nosave"`
 
 	// Mappings of user/group IDs between this namespace and its parent.
 	//
@@ -53,7 +55,10 @@ type UserNamespace struct {
 }
 
 // NewRootUserNamespace returns a UserNamespace that is appropriate for a
-// system's root user namespace.
+// system's root user namespace. Note that namespaces returned by separate calls
+// to this function are *distinct* namespaces. Once a root namespace is created
+// by this function, the returned value must be reused to refer to the same
+// namespace.
 func NewRootUserNamespace() *UserNamespace {
 	var ns UserNamespace
 	// """

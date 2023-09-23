@@ -17,8 +17,9 @@
 package pipe
 
 import (
+	"sync"
+
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
@@ -42,10 +43,13 @@ func New(linkAddr1, linkAddr2 tcpip.LinkAddress, mtu uint32) (*Endpoint, *Endpoi
 
 // Endpoint is one end of a pipe.
 type Endpoint struct {
+	linked   *Endpoint
+	linkAddr tcpip.LinkAddress
+	mtu      uint32
+
+	mu sync.RWMutex
+	// +checklocks:mu
 	dispatcher stack.NetworkDispatcher
-	linked     *Endpoint
-	linkAddr   tcpip.LinkAddress
-	mtu        uint32
 }
 
 func (e *Endpoint) deliverPackets(pkts stack.PacketBufferList) {
@@ -53,11 +57,17 @@ func (e *Endpoint) deliverPackets(pkts stack.PacketBufferList) {
 		return
 	}
 
-	for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
+	for _, pkt := range pkts.AsSlice() {
+		// Create a fresh packet with pkt's payload but without struct fields
+		// or headers set so the next link protocol can properly set the link
+		// header.
 		newPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-			Data: buffer.NewVectorisedView(pkt.Size(), pkt.Views()),
+			Payload: pkt.ToBuffer(),
 		})
-		e.linked.dispatcher.DeliverNetworkPacket(pkt.NetworkProtocolNumber, newPkt)
+		e.linked.mu.RLock()
+		d := e.linked.dispatcher
+		e.linked.mu.RUnlock()
+		d.DeliverNetworkPacket(pkt.NetworkProtocolNumber, newPkt)
 		newPkt.DecRef()
 	}
 }
@@ -71,11 +81,15 @@ func (e *Endpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) 
 
 // Attach implements stack.LinkEndpoint.
 func (e *Endpoint) Attach(dispatcher stack.NetworkDispatcher) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	e.dispatcher = dispatcher
 }
 
 // IsAttached implements stack.LinkEndpoint.
 func (e *Endpoint) IsAttached() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	return e.dispatcher != nil
 }
 
@@ -108,4 +122,7 @@ func (*Endpoint) ARPHardwareType() header.ARPHardwareType {
 }
 
 // AddHeader implements stack.LinkEndpoint.
-func (*Endpoint) AddHeader(*stack.PacketBuffer) {}
+func (*Endpoint) AddHeader(stack.PacketBufferPtr) {}
+
+// ParseHeader implements stack.LinkEndpoint.
+func (*Endpoint) ParseHeader(stack.PacketBufferPtr) bool { return true }

@@ -98,8 +98,10 @@ func (c *CPU) ClearErrorCode() {
 	c.errorType = 1 // User mode.
 }
 
+// FaultAddr returns the last fault address.
+//
 //go:nosplit
-func (c *CPU) GetFaultAddr() (value uintptr) {
+func (c *CPU) FaultAddr() (value uintptr) {
 	return c.faultAddr
 }
 
@@ -124,6 +126,7 @@ func (c *CPU) SetAppAddr(value uintptr) {
 }
 
 // GetLazyVFP returns the value of cpacr_el1.
+//
 //go:nosplit
 func (c *CPU) GetLazyVFP() (value uintptr) {
 	return c.lazyVFP

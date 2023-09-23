@@ -18,6 +18,7 @@ import (
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
+	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 )
 
@@ -25,6 +26,7 @@ import (
 type cpuController struct {
 	controllerCommon
 	controllerStateless
+	controllerNoResource
 
 	// CFS bandwidth control parameters, values in microseconds.
 	cfsPeriod atomicbitops.Int64
@@ -57,7 +59,7 @@ func newCPUController(fs *filesystem, defaults map[string]int64) *cpuController 
 		delete(defaults, "cpu.shares")
 	}
 
-	c.controllerCommon.init(controllerCPU, fs)
+	c.controllerCommon.init(kernel.CgroupControllerCPU, fs)
 	return c
 }
 
@@ -74,7 +76,7 @@ func (c *cpuController) Clone() controller {
 
 // AddControlFiles implements controller.AddControlFiles.
 func (c *cpuController) AddControlFiles(ctx context.Context, creds *auth.Credentials, _ *cgroupInode, contents map[string]kernfs.Inode) {
-	contents["cpu.cfs_period_us"] = c.fs.newStubControllerFile(ctx, creds, &c.cfsPeriod)
-	contents["cpu.cfs_quota_us"] = c.fs.newStubControllerFile(ctx, creds, &c.cfsQuota)
-	contents["cpu.shares"] = c.fs.newStubControllerFile(ctx, creds, &c.shares)
+	contents["cpu.cfs_period_us"] = c.fs.newStubControllerFile(ctx, creds, &c.cfsPeriod, true)
+	contents["cpu.cfs_quota_us"] = c.fs.newStubControllerFile(ctx, creds, &c.cfsQuota, true)
+	contents["cpu.shares"] = c.fs.newStubControllerFile(ctx, creds, &c.shares, true)
 }

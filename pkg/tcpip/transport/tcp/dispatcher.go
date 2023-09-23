@@ -148,6 +148,11 @@ func (p *processor) handleConnecting(ep *endpoint) {
 	if err := ep.h.processSegments(); err != nil { // +checklocksforce:ep.h.ep.mu
 		// handshake failed. clean up the tcp endpoint and handshake
 		// state.
+		if lEP := ep.h.listenEP; lEP != nil {
+			lEP.acceptMu.Lock()
+			delete(lEP.acceptQueue.pendingEndpoints, ep)
+			lEP.acceptMu.Unlock()
+		}
 		ep.handshakeFailed(err)
 		cleanup()
 		return
@@ -191,7 +196,6 @@ func (p *processor) handleConnected(ep *endpoint) {
 		fallthrough
 	case ep.EndpointState() == StateClose:
 		ep.mu.Unlock()
-		ep.stack.Stats().TCP.CurrentConnected.Decrement()
 		ep.drainClosingSegmentQueue()
 		ep.waiterQueue.Notify(waiter.EventHUp | waiter.EventErr | waiter.ReadableEvents | waiter.WritableEvents)
 		return
@@ -322,9 +326,10 @@ func (p *processor) start(wg *sync.WaitGroup) {
 				default:
 					panic(fmt.Sprintf("unexpected tcp state in processor: %v", state))
 				}
-				// If there are more segments to process then
+				// If there are more segments to process and the
+				// endpoint lock is not held by user then
 				// requeue this endpoint for processing.
-				if !ep.segmentQueue.empty() {
+				if !ep.segmentQueue.empty() && !ep.isOwnedByUser() {
 					p.epQ.enqueue(ep)
 				}
 			}
@@ -404,7 +409,7 @@ func (d *dispatcher) wait() {
 
 // queuePacket queues an incoming packet to the matching tcp endpoint and
 // also queues the endpoint to a processor queue for processing.
-func (d *dispatcher) queuePacket(stackEP stack.TransportEndpoint, id stack.TransportEndpointID, clock tcpip.Clock, pkt *stack.PacketBuffer) {
+func (d *dispatcher) queuePacket(stackEP stack.TransportEndpoint, id stack.TransportEndpointID, clock tcpip.Clock, pkt stack.PacketBufferPtr) {
 	d.mu.Lock()
 	closed := d.closed
 	d.mu.Unlock()
@@ -415,13 +420,13 @@ func (d *dispatcher) queuePacket(stackEP stack.TransportEndpoint, id stack.Trans
 
 	ep := stackEP.(*endpoint)
 
-	s := newIncomingSegment(id, clock, pkt)
-	defer s.DecRef()
-	if !s.parse(pkt.RXTransportChecksumValidated) {
+	s, err := newIncomingSegment(id, clock, pkt)
+	if err != nil {
 		ep.stack.Stats().TCP.InvalidSegmentsReceived.Increment()
 		ep.stats.ReceiveErrors.MalformedPacketsReceived.Increment()
 		return
 	}
+	defer s.DecRef()
 
 	if !s.csumValid {
 		ep.stack.Stats().TCP.ChecksumErrors.Increment()
@@ -439,7 +444,12 @@ func (d *dispatcher) queuePacket(stackEP stack.TransportEndpoint, id stack.Trans
 		return
 	}
 
-	d.selectProcessor(id).queueEndpoint(ep)
+	// Only wakeup the processor if endpoint lock is not held by a user
+	// goroutine as endpoint.UnlockUser will wake up the processor if the
+	// segment queue is not empty.
+	if !ep.isOwnedByUser() {
+		d.selectProcessor(id).queueEndpoint(ep)
+	}
 }
 
 // selectProcessor uses a hash of the transport endpoint ID to queue the
@@ -494,7 +504,7 @@ func (j jenkinsHasher) hash(id stack.TransportEndpointID) uint32 {
 
 	h := jenkins.Sum32(j.seed)
 	h.Write(payload[:])
-	h.Write([]byte(id.LocalAddress))
-	h.Write([]byte(id.RemoteAddress))
+	h.Write(id.LocalAddress.AsSlice())
+	h.Write(id.RemoteAddress.AsSlice())
 	return h.Sum32()
 }

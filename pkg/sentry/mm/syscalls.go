@@ -17,7 +17,6 @@ package mm
 import (
 	"fmt"
 	mrand "math/rand"
-	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
@@ -160,8 +159,8 @@ func (mm *MemoryManager) MMap(ctx context.Context, opts memmap.MMapOpts) (hostar
 // into mm.as if it is active.
 //
 // Preconditions:
-// * mm.mappingMu must be locked.
-// * vseg.Range().IsSupersetOf(ar).
+//   - mm.mappingMu must be locked.
+//   - vseg.Range().IsSupersetOf(ar).
 func (mm *MemoryManager) populateVMA(ctx context.Context, vseg vmaIterator, ar hostarch.AddrRange, precommit bool) {
 	if !vseg.ValuePtr().effectivePerms.Any() {
 		// Linux doesn't populate inaccessible pages. See
@@ -204,8 +203,8 @@ func (mm *MemoryManager) populateVMA(ctx context.Context, vseg vmaIterator, ar h
 // expensive operations that don't require it to be locked.
 //
 // Preconditions:
-// * mm.mappingMu must be locked for writing.
-// * vseg.Range().IsSupersetOf(ar).
+//   - mm.mappingMu must be locked for writing.
+//   - vseg.Range().IsSupersetOf(ar).
 //
 // Postconditions: mm.mappingMu will be unlocked.
 // +checklocksrelease:mm.mappingMu
@@ -1301,23 +1300,42 @@ func (mm *MemoryManager) VirtualDataSize() uint64 {
 // EnableMembarrierPrivate causes future calls to IsMembarrierPrivateEnabled to
 // return true.
 func (mm *MemoryManager) EnableMembarrierPrivate() {
-	atomic.StoreUint32(&mm.membarrierPrivateEnabled, 1)
+	mm.membarrierPrivateEnabled.Store(1)
 }
 
 // IsMembarrierPrivateEnabled returns true if mm.EnableMembarrierPrivate() has
 // previously been called.
 func (mm *MemoryManager) IsMembarrierPrivateEnabled() bool {
-	return atomic.LoadUint32(&mm.membarrierPrivateEnabled) != 0
+	return mm.membarrierPrivateEnabled.Load() != 0
 }
 
 // EnableMembarrierRSeq causes future calls to IsMembarrierRSeqEnabled to
 // return true.
 func (mm *MemoryManager) EnableMembarrierRSeq() {
-	atomic.StoreUint32(&mm.membarrierRSeqEnabled, 1)
+	mm.membarrierRSeqEnabled.Store(1)
 }
 
 // IsMembarrierRSeqEnabled returns true if mm.EnableMembarrierRSeq() has
 // previously been called.
 func (mm *MemoryManager) IsMembarrierRSeqEnabled() bool {
-	return atomic.LoadUint32(&mm.membarrierRSeqEnabled) != 0
+	return mm.membarrierRSeqEnabled.Load() != 0
+}
+
+// FindVMAByName finds a vma with the specified name and returns its start address and offset.
+func (mm *MemoryManager) FindVMAByName(ar hostarch.AddrRange, hint string) (hostarch.Addr, uint64, error) {
+	mm.mappingMu.RLock()
+	defer mm.mappingMu.RUnlock()
+
+	for vseg := mm.vmas.LowerBoundSegment(ar.Start); vseg.Ok(); vseg = vseg.NextSegment() {
+		start := vseg.Start()
+		if !ar.Contains(start) {
+			break
+		}
+		vma := vseg.ValuePtr()
+
+		if vma.hint == hint {
+			return start, vma.off, nil
+		}
+	}
+	return 0, 0, fmt.Errorf("could not find \"%s\" in %s", hint, ar)
 }

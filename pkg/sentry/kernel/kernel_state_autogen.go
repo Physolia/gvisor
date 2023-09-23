@@ -4,7 +4,6 @@ package kernel
 
 import (
 	"gvisor.dev/gvisor/pkg/bpf"
-	"gvisor.dev/gvisor/pkg/sentry/device"
 	"gvisor.dev/gvisor/pkg/state"
 	"gvisor.dev/gvisor/pkg/tcpip"
 )
@@ -103,6 +102,7 @@ func (h *hierarchy) StateTypeName() string {
 func (h *hierarchy) StateFields() []string {
 	return []string{
 		"id",
+		"name",
 		"controllers",
 		"fs",
 	}
@@ -114,8 +114,9 @@ func (h *hierarchy) beforeSave() {}
 func (h *hierarchy) StateSave(stateSinkObject state.Sink) {
 	h.beforeSave()
 	stateSinkObject.Save(0, &h.id)
-	stateSinkObject.Save(1, &h.controllers)
-	stateSinkObject.Save(2, &h.fs)
+	stateSinkObject.Save(1, &h.name)
+	stateSinkObject.Save(2, &h.controllers)
+	stateSinkObject.Save(3, &h.fs)
 }
 
 func (h *hierarchy) afterLoad() {}
@@ -123,8 +124,9 @@ func (h *hierarchy) afterLoad() {}
 // +checklocksignore
 func (h *hierarchy) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &h.id)
-	stateSourceObject.Load(1, &h.controllers)
-	stateSourceObject.Load(2, &h.fs)
+	stateSourceObject.Load(1, &h.name)
+	stateSourceObject.Load(2, &h.controllers)
+	stateSourceObject.Load(3, &h.fs)
 }
 
 func (r *CgroupRegistry) StateTypeName() string {
@@ -134,8 +136,11 @@ func (r *CgroupRegistry) StateTypeName() string {
 func (r *CgroupRegistry) StateFields() []string {
 	return []string{
 		"lastHierarchyID",
+		"lastCgroupID",
 		"controllers",
 		"hierarchies",
+		"hierarchiesByName",
+		"cgroups",
 	}
 }
 
@@ -145,8 +150,11 @@ func (r *CgroupRegistry) beforeSave() {}
 func (r *CgroupRegistry) StateSave(stateSinkObject state.Sink) {
 	r.beforeSave()
 	stateSinkObject.Save(0, &r.lastHierarchyID)
-	stateSinkObject.Save(1, &r.controllers)
-	stateSinkObject.Save(2, &r.hierarchies)
+	stateSinkObject.Save(1, &r.lastCgroupID)
+	stateSinkObject.Save(2, &r.controllers)
+	stateSinkObject.Save(3, &r.hierarchies)
+	stateSinkObject.Save(4, &r.hierarchiesByName)
+	stateSinkObject.Save(5, &r.cgroups)
 }
 
 func (r *CgroupRegistry) afterLoad() {}
@@ -154,8 +162,11 @@ func (r *CgroupRegistry) afterLoad() {}
 // +checklocksignore
 func (r *CgroupRegistry) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &r.lastHierarchyID)
-	stateSourceObject.Load(1, &r.controllers)
-	stateSourceObject.Load(2, &r.hierarchies)
+	stateSourceObject.Load(1, &r.lastCgroupID)
+	stateSourceObject.Load(2, &r.controllers)
+	stateSourceObject.Load(3, &r.hierarchies)
+	stateSourceObject.Load(4, &r.hierarchiesByName)
+	stateSourceObject.Load(5, &r.cgroups)
 }
 
 func (f *FDFlags) StateTypeName() string {
@@ -190,7 +201,6 @@ func (d *descriptor) StateTypeName() string {
 func (d *descriptor) StateFields() []string {
 	return []string{
 		"file",
-		"fileVFS2",
 		"flags",
 	}
 }
@@ -201,8 +211,7 @@ func (d *descriptor) beforeSave() {}
 func (d *descriptor) StateSave(stateSinkObject state.Sink) {
 	d.beforeSave()
 	stateSinkObject.Save(0, &d.file)
-	stateSinkObject.Save(1, &d.fileVFS2)
-	stateSinkObject.Save(2, &d.flags)
+	stateSinkObject.Save(1, &d.flags)
 }
 
 func (d *descriptor) afterLoad() {}
@@ -210,8 +219,7 @@ func (d *descriptor) afterLoad() {}
 // +checklocksignore
 func (d *descriptor) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &d.file)
-	stateSourceObject.Load(1, &d.fileVFS2)
-	stateSourceObject.Load(2, &d.flags)
+	stateSourceObject.Load(1, &d.flags)
 }
 
 func (f *FDTable) StateTypeName() string {
@@ -244,7 +252,7 @@ func (f *FDTable) afterLoad() {}
 func (f *FDTable) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &f.FDTableRefs)
 	stateSourceObject.Load(1, &f.k)
-	stateSourceObject.LoadValue(2, new(map[int32]descriptor), func(y interface{}) { f.loadDescriptorTable(y.(map[int32]descriptor)) })
+	stateSourceObject.LoadValue(2, new(map[int32]descriptor), func(y any) { f.loadDescriptorTable(y.(map[int32]descriptor)) })
 }
 
 func (r *FDTableRefs) StateTypeName() string {
@@ -279,9 +287,7 @@ func (f *FSContext) StateFields() []string {
 	return []string{
 		"FSContextRefs",
 		"root",
-		"rootVFS2",
 		"cwd",
-		"cwdVFS2",
 		"umask",
 	}
 }
@@ -293,10 +299,8 @@ func (f *FSContext) StateSave(stateSinkObject state.Sink) {
 	f.beforeSave()
 	stateSinkObject.Save(0, &f.FSContextRefs)
 	stateSinkObject.Save(1, &f.root)
-	stateSinkObject.Save(2, &f.rootVFS2)
-	stateSinkObject.Save(3, &f.cwd)
-	stateSinkObject.Save(4, &f.cwdVFS2)
-	stateSinkObject.Save(5, &f.umask)
+	stateSinkObject.Save(2, &f.cwd)
+	stateSinkObject.Save(3, &f.umask)
 }
 
 func (f *FSContext) afterLoad() {}
@@ -305,10 +309,8 @@ func (f *FSContext) afterLoad() {}
 func (f *FSContext) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &f.FSContextRefs)
 	stateSourceObject.Load(1, &f.root)
-	stateSourceObject.Load(2, &f.rootVFS2)
-	stateSourceObject.Load(3, &f.cwd)
-	stateSourceObject.Load(4, &f.cwdVFS2)
-	stateSourceObject.Load(5, &f.umask)
+	stateSourceObject.Load(2, &f.cwd)
+	stateSourceObject.Load(3, &f.umask)
 }
 
 func (r *FSContextRefs) StateTypeName() string {
@@ -341,7 +343,7 @@ func (i *IPCNamespace) StateTypeName() string {
 
 func (i *IPCNamespace) StateFields() []string {
 	return []string{
-		"IPCNamespaceRefs",
+		"inode",
 		"userNS",
 		"queues",
 		"semaphores",
@@ -355,7 +357,7 @@ func (i *IPCNamespace) beforeSave() {}
 // +checklocksignore
 func (i *IPCNamespace) StateSave(stateSinkObject state.Sink) {
 	i.beforeSave()
-	stateSinkObject.Save(0, &i.IPCNamespaceRefs)
+	stateSinkObject.Save(0, &i.inode)
 	stateSinkObject.Save(1, &i.userNS)
 	stateSinkObject.Save(2, &i.queues)
 	stateSinkObject.Save(3, &i.semaphores)
@@ -367,36 +369,12 @@ func (i *IPCNamespace) afterLoad() {}
 
 // +checklocksignore
 func (i *IPCNamespace) StateLoad(stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &i.IPCNamespaceRefs)
+	stateSourceObject.Load(0, &i.inode)
 	stateSourceObject.Load(1, &i.userNS)
 	stateSourceObject.Load(2, &i.queues)
 	stateSourceObject.Load(3, &i.semaphores)
 	stateSourceObject.Load(4, &i.shms)
 	stateSourceObject.Load(5, &i.posixQueues)
-}
-
-func (r *IPCNamespaceRefs) StateTypeName() string {
-	return "pkg/sentry/kernel.IPCNamespaceRefs"
-}
-
-func (r *IPCNamespaceRefs) StateFields() []string {
-	return []string{
-		"refCount",
-	}
-}
-
-func (r *IPCNamespaceRefs) beforeSave() {}
-
-// +checklocksignore
-func (r *IPCNamespaceRefs) StateSave(stateSinkObject state.Sink) {
-	r.beforeSave()
-	stateSinkObject.Save(0, &r.refCount)
-}
-
-// +checklocksignore
-func (r *IPCNamespaceRefs) StateLoad(stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &r.refCount)
-	stateSourceObject.AfterLoad(r.afterLoad)
 }
 
 func (uc *userCounters) StateTypeName() string {
@@ -450,23 +428,21 @@ func (k *Kernel) StateFields() []string {
 		"syslog",
 		"runningTasks",
 		"cpuClock",
-		"cpuClockTickerDisabled",
-		"cpuClockTickerSetting",
+		"cpuClockTickerRunning",
 		"uniqueID",
 		"nextInotifyCookie",
 		"netlinkPorts",
 		"danglingEndpoints",
 		"sockets",
-		"socketsVFS2",
 		"nextSocketRecord",
-		"deviceRegistry",
-		"DirentCacheLimiter",
 		"SpecialOpts",
 		"vfs",
 		"hostMount",
 		"pipeMount",
+		"nsfsMount",
 		"shmMount",
 		"socketMount",
+		"sysVShmDevID",
 		"SleepForAddressSpaceActivation",
 		"ptraceExceptions",
 		"YAMAPtraceScope",
@@ -482,10 +458,7 @@ func (k *Kernel) StateSave(stateSinkObject state.Sink) {
 	k.beforeSave()
 	var danglingEndpointsValue []tcpip.Endpoint
 	danglingEndpointsValue = k.saveDanglingEndpoints()
-	stateSinkObject.SaveValue(22, danglingEndpointsValue)
-	var deviceRegistryValue *device.Registry
-	deviceRegistryValue = k.saveDeviceRegistry()
-	stateSinkObject.SaveValue(26, deviceRegistryValue)
+	stateSinkObject.SaveValue(21, danglingEndpointsValue)
 	stateSinkObject.Save(0, &k.featureSet)
 	stateSinkObject.Save(1, &k.timekeeper)
 	stateSinkObject.Save(2, &k.tasks)
@@ -503,26 +476,25 @@ func (k *Kernel) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(14, &k.syslog)
 	stateSinkObject.Save(15, &k.runningTasks)
 	stateSinkObject.Save(16, &k.cpuClock)
-	stateSinkObject.Save(17, &k.cpuClockTickerDisabled)
-	stateSinkObject.Save(18, &k.cpuClockTickerSetting)
-	stateSinkObject.Save(19, &k.uniqueID)
-	stateSinkObject.Save(20, &k.nextInotifyCookie)
-	stateSinkObject.Save(21, &k.netlinkPorts)
-	stateSinkObject.Save(23, &k.sockets)
-	stateSinkObject.Save(24, &k.socketsVFS2)
-	stateSinkObject.Save(25, &k.nextSocketRecord)
-	stateSinkObject.Save(27, &k.DirentCacheLimiter)
-	stateSinkObject.Save(28, &k.SpecialOpts)
-	stateSinkObject.Save(29, &k.vfs)
-	stateSinkObject.Save(30, &k.hostMount)
-	stateSinkObject.Save(31, &k.pipeMount)
-	stateSinkObject.Save(32, &k.shmMount)
-	stateSinkObject.Save(33, &k.socketMount)
-	stateSinkObject.Save(34, &k.SleepForAddressSpaceActivation)
-	stateSinkObject.Save(35, &k.ptraceExceptions)
-	stateSinkObject.Save(36, &k.YAMAPtraceScope)
-	stateSinkObject.Save(37, &k.cgroupRegistry)
-	stateSinkObject.Save(38, &k.userCountersMap)
+	stateSinkObject.Save(17, &k.cpuClockTickerRunning)
+	stateSinkObject.Save(18, &k.uniqueID)
+	stateSinkObject.Save(19, &k.nextInotifyCookie)
+	stateSinkObject.Save(20, &k.netlinkPorts)
+	stateSinkObject.Save(22, &k.sockets)
+	stateSinkObject.Save(23, &k.nextSocketRecord)
+	stateSinkObject.Save(24, &k.SpecialOpts)
+	stateSinkObject.Save(25, &k.vfs)
+	stateSinkObject.Save(26, &k.hostMount)
+	stateSinkObject.Save(27, &k.pipeMount)
+	stateSinkObject.Save(28, &k.nsfsMount)
+	stateSinkObject.Save(29, &k.shmMount)
+	stateSinkObject.Save(30, &k.socketMount)
+	stateSinkObject.Save(31, &k.sysVShmDevID)
+	stateSinkObject.Save(32, &k.SleepForAddressSpaceActivation)
+	stateSinkObject.Save(33, &k.ptraceExceptions)
+	stateSinkObject.Save(34, &k.YAMAPtraceScope)
+	stateSinkObject.Save(35, &k.cgroupRegistry)
+	stateSinkObject.Save(36, &k.userCountersMap)
 }
 
 func (k *Kernel) afterLoad() {}
@@ -546,28 +518,26 @@ func (k *Kernel) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(14, &k.syslog)
 	stateSourceObject.Load(15, &k.runningTasks)
 	stateSourceObject.Load(16, &k.cpuClock)
-	stateSourceObject.Load(17, &k.cpuClockTickerDisabled)
-	stateSourceObject.Load(18, &k.cpuClockTickerSetting)
-	stateSourceObject.Load(19, &k.uniqueID)
-	stateSourceObject.Load(20, &k.nextInotifyCookie)
-	stateSourceObject.Load(21, &k.netlinkPorts)
-	stateSourceObject.Load(23, &k.sockets)
-	stateSourceObject.Load(24, &k.socketsVFS2)
-	stateSourceObject.Load(25, &k.nextSocketRecord)
-	stateSourceObject.Load(27, &k.DirentCacheLimiter)
-	stateSourceObject.Load(28, &k.SpecialOpts)
-	stateSourceObject.Load(29, &k.vfs)
-	stateSourceObject.Load(30, &k.hostMount)
-	stateSourceObject.Load(31, &k.pipeMount)
-	stateSourceObject.Load(32, &k.shmMount)
-	stateSourceObject.Load(33, &k.socketMount)
-	stateSourceObject.Load(34, &k.SleepForAddressSpaceActivation)
-	stateSourceObject.Load(35, &k.ptraceExceptions)
-	stateSourceObject.Load(36, &k.YAMAPtraceScope)
-	stateSourceObject.Load(37, &k.cgroupRegistry)
-	stateSourceObject.Load(38, &k.userCountersMap)
-	stateSourceObject.LoadValue(22, new([]tcpip.Endpoint), func(y interface{}) { k.loadDanglingEndpoints(y.([]tcpip.Endpoint)) })
-	stateSourceObject.LoadValue(26, new(*device.Registry), func(y interface{}) { k.loadDeviceRegistry(y.(*device.Registry)) })
+	stateSourceObject.Load(17, &k.cpuClockTickerRunning)
+	stateSourceObject.Load(18, &k.uniqueID)
+	stateSourceObject.Load(19, &k.nextInotifyCookie)
+	stateSourceObject.Load(20, &k.netlinkPorts)
+	stateSourceObject.Load(22, &k.sockets)
+	stateSourceObject.Load(23, &k.nextSocketRecord)
+	stateSourceObject.Load(24, &k.SpecialOpts)
+	stateSourceObject.Load(25, &k.vfs)
+	stateSourceObject.Load(26, &k.hostMount)
+	stateSourceObject.Load(27, &k.pipeMount)
+	stateSourceObject.Load(28, &k.nsfsMount)
+	stateSourceObject.Load(29, &k.shmMount)
+	stateSourceObject.Load(30, &k.socketMount)
+	stateSourceObject.Load(31, &k.sysVShmDevID)
+	stateSourceObject.Load(32, &k.SleepForAddressSpaceActivation)
+	stateSourceObject.Load(33, &k.ptraceExceptions)
+	stateSourceObject.Load(34, &k.YAMAPtraceScope)
+	stateSourceObject.Load(35, &k.cgroupRegistry)
+	stateSourceObject.Load(36, &k.userCountersMap)
+	stateSourceObject.LoadValue(21, new([]tcpip.Endpoint), func(y any) { k.loadDanglingEndpoints(y.([]tcpip.Endpoint)) })
 }
 
 func (s *SocketRecord) StateTypeName() string {
@@ -578,7 +548,6 @@ func (s *SocketRecord) StateFields() []string {
 	return []string{
 		"k",
 		"Sock",
-		"SockVFS2",
 		"ID",
 	}
 }
@@ -590,8 +559,7 @@ func (s *SocketRecord) StateSave(stateSinkObject state.Sink) {
 	s.beforeSave()
 	stateSinkObject.Save(0, &s.k)
 	stateSinkObject.Save(1, &s.Sock)
-	stateSinkObject.Save(2, &s.SockVFS2)
-	stateSinkObject.Save(3, &s.ID)
+	stateSinkObject.Save(2, &s.ID)
 }
 
 func (s *SocketRecord) afterLoad() {}
@@ -600,36 +568,7 @@ func (s *SocketRecord) afterLoad() {}
 func (s *SocketRecord) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &s.k)
 	stateSourceObject.Load(1, &s.Sock)
-	stateSourceObject.Load(2, &s.SockVFS2)
-	stateSourceObject.Load(3, &s.ID)
-}
-
-func (s *SocketRecordVFS1) StateTypeName() string {
-	return "pkg/sentry/kernel.SocketRecordVFS1"
-}
-
-func (s *SocketRecordVFS1) StateFields() []string {
-	return []string{
-		"socketEntry",
-		"SocketRecord",
-	}
-}
-
-func (s *SocketRecordVFS1) beforeSave() {}
-
-// +checklocksignore
-func (s *SocketRecordVFS1) StateSave(stateSinkObject state.Sink) {
-	s.beforeSave()
-	stateSinkObject.Save(0, &s.socketEntry)
-	stateSinkObject.Save(1, &s.SocketRecord)
-}
-
-func (s *SocketRecordVFS1) afterLoad() {}
-
-// +checklocksignore
-func (s *SocketRecordVFS1) StateLoad(stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &s.socketEntry)
-	stateSourceObject.Load(1, &s.SocketRecord)
+	stateSourceObject.Load(2, &s.ID)
 }
 
 func (p *pendingSignals) StateTypeName() string {
@@ -656,7 +595,7 @@ func (p *pendingSignals) afterLoad() {}
 
 // +checklocksignore
 func (p *pendingSignals) StateLoad(stateSourceObject state.Source) {
-	stateSourceObject.LoadValue(0, new([]savedPendingSignal), func(y interface{}) { p.loadSignals(y.([]savedPendingSignal)) })
+	stateSourceObject.LoadValue(0, new([]savedPendingSignal), func(y any) { p.loadSignals(y.([]savedPendingSignal)) })
 }
 
 func (p *pendingSignalQueue) StateTypeName() string {
@@ -1224,62 +1163,6 @@ func (sh *SignalHandlers) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &sh.actions)
 }
 
-func (l *socketList) StateTypeName() string {
-	return "pkg/sentry/kernel.socketList"
-}
-
-func (l *socketList) StateFields() []string {
-	return []string{
-		"head",
-		"tail",
-	}
-}
-
-func (l *socketList) beforeSave() {}
-
-// +checklocksignore
-func (l *socketList) StateSave(stateSinkObject state.Sink) {
-	l.beforeSave()
-	stateSinkObject.Save(0, &l.head)
-	stateSinkObject.Save(1, &l.tail)
-}
-
-func (l *socketList) afterLoad() {}
-
-// +checklocksignore
-func (l *socketList) StateLoad(stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &l.head)
-	stateSourceObject.Load(1, &l.tail)
-}
-
-func (e *socketEntry) StateTypeName() string {
-	return "pkg/sentry/kernel.socketEntry"
-}
-
-func (e *socketEntry) StateFields() []string {
-	return []string{
-		"next",
-		"prev",
-	}
-}
-
-func (e *socketEntry) beforeSave() {}
-
-// +checklocksignore
-func (e *socketEntry) StateSave(stateSinkObject state.Sink) {
-	e.beforeSave()
-	stateSinkObject.Save(0, &e.next)
-	stateSinkObject.Save(1, &e.prev)
-}
-
-func (e *socketEntry) afterLoad() {}
-
-// +checklocksignore
-func (e *socketEntry) StateLoad(stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &e.next)
-	stateSourceObject.Load(1, &e.prev)
-}
-
 func (s *syscallTableInfo) StateTypeName() string {
 	return "pkg/sentry/kernel.syscallTableInfo"
 }
@@ -1386,7 +1269,7 @@ func (t *Task) StateFields() []string {
 		"utsns",
 		"ipcns",
 		"abstractSockets",
-		"mountNamespaceVFS2",
+		"mountNamespace",
 		"parentDeathSignal",
 		"syscallFilters",
 		"cleartid",
@@ -1404,7 +1287,9 @@ func (t *Task) StateFields() []string {
 		"startTime",
 		"kcov",
 		"cgroups",
+		"memCgID",
 		"userCounters",
+		"sessionKeyring",
 	}
 }
 
@@ -1465,7 +1350,7 @@ func (t *Task) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(44, &t.utsns)
 	stateSinkObject.Save(45, &t.ipcns)
 	stateSinkObject.Save(46, &t.abstractSockets)
-	stateSinkObject.Save(47, &t.mountNamespaceVFS2)
+	stateSinkObject.Save(47, &t.mountNamespace)
 	stateSinkObject.Save(48, &t.parentDeathSignal)
 	stateSinkObject.Save(50, &t.cleartid)
 	stateSinkObject.Save(51, &t.allowedCPUMask)
@@ -1482,7 +1367,9 @@ func (t *Task) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(62, &t.startTime)
 	stateSinkObject.Save(63, &t.kcov)
 	stateSinkObject.Save(64, &t.cgroups)
-	stateSinkObject.Save(65, &t.userCounters)
+	stateSinkObject.Save(65, &t.memCgID)
+	stateSinkObject.Save(66, &t.userCounters)
+	stateSinkObject.Save(67, &t.sessionKeyring)
 }
 
 // +checklocksignore
@@ -1533,7 +1420,7 @@ func (t *Task) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(44, &t.utsns)
 	stateSourceObject.Load(45, &t.ipcns)
 	stateSourceObject.Load(46, &t.abstractSockets)
-	stateSourceObject.Load(47, &t.mountNamespaceVFS2)
+	stateSourceObject.Load(47, &t.mountNamespace)
 	stateSourceObject.Load(48, &t.parentDeathSignal)
 	stateSourceObject.Load(50, &t.cleartid)
 	stateSourceObject.Load(51, &t.allowedCPUMask)
@@ -1550,9 +1437,11 @@ func (t *Task) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(62, &t.startTime)
 	stateSourceObject.Load(63, &t.kcov)
 	stateSourceObject.Load(64, &t.cgroups)
-	stateSourceObject.Load(65, &t.userCounters)
-	stateSourceObject.LoadValue(32, new(*Task), func(y interface{}) { t.loadPtraceTracer(y.(*Task)) })
-	stateSourceObject.LoadValue(49, new([]bpf.Program), func(y interface{}) { t.loadSyscallFilters(y.([]bpf.Program)) })
+	stateSourceObject.Load(65, &t.memCgID)
+	stateSourceObject.Load(66, &t.userCounters)
+	stateSourceObject.Load(67, &t.sessionKeyring)
+	stateSourceObject.LoadValue(32, new(*Task), func(y any) { t.loadPtraceTracer(y.(*Task)) })
+	stateSourceObject.LoadValue(49, new([]bpf.Program), func(y any) { t.loadSyscallFilters(y.([]bpf.Program)) })
 	stateSourceObject.AfterLoad(t.afterLoad)
 }
 
@@ -1775,7 +1664,7 @@ func (image *TaskImage) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(1, &image.Arch)
 	stateSourceObject.Load(2, &image.MemoryManager)
 	stateSourceObject.Load(3, &image.fu)
-	stateSourceObject.LoadValue(4, new(syscallTableInfo), func(y interface{}) { image.loadSt(y.(syscallTableInfo)) })
+	stateSourceObject.LoadValue(4, new(syscallTableInfo), func(y any) { image.loadSt(y.(syscallTableInfo)) })
 }
 
 func (l *taskList) StateTypeName() string {
@@ -2128,9 +2017,10 @@ func (tg *ThreadGroup) StateFields() []string {
 		"processGroup",
 		"execed",
 		"oldRSeqCritical",
-		"mounts",
 		"tty",
 		"oomScoreAdj",
+		"isChildSubreaper",
+		"hasChildSubreaper",
 	}
 }
 
@@ -2171,9 +2061,10 @@ func (tg *ThreadGroup) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(26, &tg.limits)
 	stateSinkObject.Save(27, &tg.processGroup)
 	stateSinkObject.Save(28, &tg.execed)
-	stateSinkObject.Save(30, &tg.mounts)
-	stateSinkObject.Save(31, &tg.tty)
-	stateSinkObject.Save(32, &tg.oomScoreAdj)
+	stateSinkObject.Save(30, &tg.tty)
+	stateSinkObject.Save(31, &tg.oomScoreAdj)
+	stateSinkObject.Save(32, &tg.isChildSubreaper)
+	stateSinkObject.Save(33, &tg.hasChildSubreaper)
 }
 
 func (tg *ThreadGroup) afterLoad() {}
@@ -2209,10 +2100,11 @@ func (tg *ThreadGroup) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(26, &tg.limits)
 	stateSourceObject.Load(27, &tg.processGroup)
 	stateSourceObject.Load(28, &tg.execed)
-	stateSourceObject.Load(30, &tg.mounts)
-	stateSourceObject.Load(31, &tg.tty)
-	stateSourceObject.Load(32, &tg.oomScoreAdj)
-	stateSourceObject.LoadValue(29, new(*OldRSeqCriticalRegion), func(y interface{}) { tg.loadOldRSeqCritical(y.(*OldRSeqCriticalRegion)) })
+	stateSourceObject.Load(30, &tg.tty)
+	stateSourceObject.Load(31, &tg.oomScoreAdj)
+	stateSourceObject.Load(32, &tg.isChildSubreaper)
+	stateSourceObject.Load(33, &tg.hasChildSubreaper)
+	stateSourceObject.LoadValue(29, new(*OldRSeqCriticalRegion), func(y any) { tg.loadOldRSeqCritical(y.(*OldRSeqCriticalRegion)) })
 }
 
 func (l *itimerRealListener) StateTypeName() string {
@@ -2277,6 +2169,7 @@ func (ns *PIDNamespace) StateFields() []string {
 		"owner",
 		"parent",
 		"userns",
+		"id",
 		"last",
 		"tasks",
 		"tids",
@@ -2298,16 +2191,17 @@ func (ns *PIDNamespace) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &ns.owner)
 	stateSinkObject.Save(1, &ns.parent)
 	stateSinkObject.Save(2, &ns.userns)
-	stateSinkObject.Save(3, &ns.last)
-	stateSinkObject.Save(4, &ns.tasks)
-	stateSinkObject.Save(5, &ns.tids)
-	stateSinkObject.Save(6, &ns.tgids)
-	stateSinkObject.Save(7, &ns.sessions)
-	stateSinkObject.Save(8, &ns.sids)
-	stateSinkObject.Save(9, &ns.processGroups)
-	stateSinkObject.Save(10, &ns.pgids)
-	stateSinkObject.Save(11, &ns.exiting)
-	stateSinkObject.Save(12, &ns.extra)
+	stateSinkObject.Save(3, &ns.id)
+	stateSinkObject.Save(4, &ns.last)
+	stateSinkObject.Save(5, &ns.tasks)
+	stateSinkObject.Save(6, &ns.tids)
+	stateSinkObject.Save(7, &ns.tgids)
+	stateSinkObject.Save(8, &ns.sessions)
+	stateSinkObject.Save(9, &ns.sids)
+	stateSinkObject.Save(10, &ns.processGroups)
+	stateSinkObject.Save(11, &ns.pgids)
+	stateSinkObject.Save(12, &ns.exiting)
+	stateSinkObject.Save(13, &ns.extra)
 }
 
 func (ns *PIDNamespace) afterLoad() {}
@@ -2317,16 +2211,17 @@ func (ns *PIDNamespace) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &ns.owner)
 	stateSourceObject.Load(1, &ns.parent)
 	stateSourceObject.Load(2, &ns.userns)
-	stateSourceObject.Load(3, &ns.last)
-	stateSourceObject.Load(4, &ns.tasks)
-	stateSourceObject.Load(5, &ns.tids)
-	stateSourceObject.Load(6, &ns.tgids)
-	stateSourceObject.Load(7, &ns.sessions)
-	stateSourceObject.Load(8, &ns.sids)
-	stateSourceObject.Load(9, &ns.processGroups)
-	stateSourceObject.Load(10, &ns.pgids)
-	stateSourceObject.Load(11, &ns.exiting)
-	stateSourceObject.Load(12, &ns.extra)
+	stateSourceObject.Load(3, &ns.id)
+	stateSourceObject.Load(4, &ns.last)
+	stateSourceObject.Load(5, &ns.tasks)
+	stateSourceObject.Load(6, &ns.tids)
+	stateSourceObject.Load(7, &ns.tgids)
+	stateSourceObject.Load(8, &ns.sessions)
+	stateSourceObject.Load(9, &ns.sids)
+	stateSourceObject.Load(10, &ns.processGroups)
+	stateSourceObject.Load(11, &ns.pgids)
+	stateSourceObject.Load(12, &ns.exiting)
+	stateSourceObject.Load(13, &ns.extra)
 }
 
 func (t *threadGroupNode) StateTypeName() string {
@@ -2336,6 +2231,7 @@ func (t *threadGroupNode) StateTypeName() string {
 func (t *threadGroupNode) StateFields() []string {
 	return []string{
 		"pidns",
+		"pidWithinNS",
 		"eventQueue",
 		"leader",
 		"execing",
@@ -2352,13 +2248,14 @@ func (t *threadGroupNode) beforeSave() {}
 func (t *threadGroupNode) StateSave(stateSinkObject state.Sink) {
 	t.beforeSave()
 	stateSinkObject.Save(0, &t.pidns)
-	stateSinkObject.Save(1, &t.eventQueue)
-	stateSinkObject.Save(2, &t.leader)
-	stateSinkObject.Save(3, &t.execing)
-	stateSinkObject.Save(4, &t.tasks)
-	stateSinkObject.Save(5, &t.tasksCount)
-	stateSinkObject.Save(6, &t.liveTasks)
-	stateSinkObject.Save(7, &t.activeTasks)
+	stateSinkObject.Save(1, &t.pidWithinNS)
+	stateSinkObject.Save(2, &t.eventQueue)
+	stateSinkObject.Save(3, &t.leader)
+	stateSinkObject.Save(4, &t.execing)
+	stateSinkObject.Save(5, &t.tasks)
+	stateSinkObject.Save(6, &t.tasksCount)
+	stateSinkObject.Save(7, &t.liveTasks)
+	stateSinkObject.Save(8, &t.activeTasks)
 }
 
 func (t *threadGroupNode) afterLoad() {}
@@ -2366,13 +2263,14 @@ func (t *threadGroupNode) afterLoad() {}
 // +checklocksignore
 func (t *threadGroupNode) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &t.pidns)
-	stateSourceObject.Load(1, &t.eventQueue)
-	stateSourceObject.Load(2, &t.leader)
-	stateSourceObject.Load(3, &t.execing)
-	stateSourceObject.Load(4, &t.tasks)
-	stateSourceObject.Load(5, &t.tasksCount)
-	stateSourceObject.Load(6, &t.liveTasks)
-	stateSourceObject.Load(7, &t.activeTasks)
+	stateSourceObject.Load(1, &t.pidWithinNS)
+	stateSourceObject.Load(2, &t.eventQueue)
+	stateSourceObject.Load(3, &t.leader)
+	stateSourceObject.Load(4, &t.execing)
+	stateSourceObject.Load(5, &t.tasks)
+	stateSourceObject.Load(6, &t.tasksCount)
+	stateSourceObject.Load(7, &t.liveTasks)
+	stateSourceObject.Load(8, &t.activeTasks)
 }
 
 func (t *taskNode) StateTypeName() string {
@@ -2477,32 +2375,32 @@ func (tc *timekeeperClock) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(1, &tc.c)
 }
 
-func (t *TTY) StateTypeName() string {
+func (tty *TTY) StateTypeName() string {
 	return "pkg/sentry/kernel.TTY"
 }
 
-func (t *TTY) StateFields() []string {
+func (tty *TTY) StateFields() []string {
 	return []string{
 		"Index",
 		"tg",
 	}
 }
 
-func (t *TTY) beforeSave() {}
+func (tty *TTY) beforeSave() {}
 
 // +checklocksignore
-func (t *TTY) StateSave(stateSinkObject state.Sink) {
-	t.beforeSave()
-	stateSinkObject.Save(0, &t.Index)
-	stateSinkObject.Save(1, &t.tg)
+func (tty *TTY) StateSave(stateSinkObject state.Sink) {
+	tty.beforeSave()
+	stateSinkObject.Save(0, &tty.Index)
+	stateSinkObject.Save(1, &tty.tg)
 }
 
-func (t *TTY) afterLoad() {}
+func (tty *TTY) afterLoad() {}
 
 // +checklocksignore
-func (t *TTY) StateLoad(stateSourceObject state.Source) {
-	stateSourceObject.Load(0, &t.Index)
-	stateSourceObject.Load(1, &t.tg)
+func (tty *TTY) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &tty.Index)
+	stateSourceObject.Load(1, &tty.tg)
 }
 
 func (u *UTSNamespace) StateTypeName() string {
@@ -2514,6 +2412,7 @@ func (u *UTSNamespace) StateFields() []string {
 		"hostName",
 		"domainName",
 		"userns",
+		"inode",
 	}
 }
 
@@ -2525,6 +2424,7 @@ func (u *UTSNamespace) StateSave(stateSinkObject state.Sink) {
 	stateSinkObject.Save(0, &u.hostName)
 	stateSinkObject.Save(1, &u.domainName)
 	stateSinkObject.Save(2, &u.userns)
+	stateSinkObject.Save(3, &u.inode)
 }
 
 func (u *UTSNamespace) afterLoad() {}
@@ -2534,6 +2434,7 @@ func (u *UTSNamespace) StateLoad(stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &u.hostName)
 	stateSourceObject.Load(1, &u.domainName)
 	stateSourceObject.Load(2, &u.userns)
+	stateSourceObject.Load(3, &u.inode)
 }
 
 func (v *VDSOParamPage) StateTypeName() string {
@@ -2583,11 +2484,9 @@ func init() {
 	state.Register((*FSContext)(nil))
 	state.Register((*FSContextRefs)(nil))
 	state.Register((*IPCNamespace)(nil))
-	state.Register((*IPCNamespaceRefs)(nil))
 	state.Register((*userCounters)(nil))
 	state.Register((*Kernel)(nil))
 	state.Register((*SocketRecord)(nil))
-	state.Register((*SocketRecordVFS1)(nil))
 	state.Register((*pendingSignals)(nil))
 	state.Register((*pendingSignalQueue)(nil))
 	state.Register((*pendingSignal)(nil))
@@ -2607,8 +2506,6 @@ func init() {
 	state.Register((*Session)(nil))
 	state.Register((*ProcessGroup)(nil))
 	state.Register((*SignalHandlers)(nil))
-	state.Register((*socketList)(nil))
-	state.Register((*socketEntry)(nil))
 	state.Register((*syscallTableInfo)(nil))
 	state.Register((*syslog)(nil))
 	state.Register((*Task)(nil))

@@ -17,8 +17,8 @@
 package seccheck
 
 import (
-	"sync/atomic"
-
+	"google.golang.org/protobuf/proto"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -29,26 +29,9 @@ type Point uint
 
 // PointX represents the checkpoint X.
 const (
-	PointClone Point = iota
-	PointExecve
-	PointExitNotifyParent
-	// Add new Points above this line.
-	pointLength
-
-	numPointBitmaskUint32s = (int(pointLength)-1)/32 + 1
-)
-
-// FieldCtxtX represents a data field that comes from the Context.
-const (
-	FieldCtxtTime Field = iota
-	FieldCtxtThreadID
-	FieldCtxtThreadStartTime
-	FieldCtxtThreadGroupID
-	FieldCtxtThreadGroupStartTime
-	FieldCtxtContainerID
-	FieldCtxtCredentials
-	FieldCtxtCwd
-	FieldCtxtProcessName
+	totalPoints            = int(pointLengthBeforeSyscalls) + syscallPoints
+	numPointsPerUint32     = 32
+	numPointBitmaskUint32s = (totalPoints-1)/numPointsPerUint32 + 1
 )
 
 // FieldSet contains all optional fields to be collected by a given Point.
@@ -103,44 +86,100 @@ func (fm *FieldMask) Empty() bool {
 	return fm.mask == 0
 }
 
-// A Checker performs security checks at checkpoints.
+// A Sink performs security checks at checkpoints.
 //
-// Each Checker method X is called at checkpoint X; if the method may return a
+// Each Sink method X is called at checkpoint X; if the method may return a
 // non-nil error and does so, it causes the checked operation to fail
-// immediately (without calling subsequent Checkers) and return the error. The
+// immediately (without calling subsequent Sinks) and return the error. The
 // info argument contains information relevant to the check. The mask argument
 // indicates what fields in info are valid; the mask should usually be a
-// superset of fields requested by the Checker's corresponding PointReq, but
-// may be missing requested fields in some cases (e.g. if the Checker is
+// superset of fields requested by the Sink's corresponding PointReq, but
+// may be missing requested fields in some cases (e.g. if the Sink is
 // registered concurrently with invocations of checkpoints).
-type Checker interface {
+type Sink interface {
+	// Name return the sink name.
+	Name() string
+	// Status returns the sink runtime status.
+	Status() SinkStatus
+	// Stop requests the sink to stop.
+	Stop()
+
 	Clone(ctx context.Context, fields FieldSet, info *pb.CloneInfo) error
 	Execve(ctx context.Context, fields FieldSet, info *pb.ExecveInfo) error
 	ExitNotifyParent(ctx context.Context, fields FieldSet, info *pb.ExitNotifyParentInfo) error
+	TaskExit(context.Context, FieldSet, *pb.TaskExit) error
+
+	ContainerStart(context.Context, FieldSet, *pb.Start) error
+
+	Syscall(context.Context, FieldSet, *pb.ContextData, pb.MessageType, proto.Message) error
+	RawSyscall(context.Context, FieldSet, *pb.Syscall) error
 }
 
-// CheckerDefaults may be embedded by implementations of Checker to obtain
-// no-op implementations of Checker methods that may be explicitly overridden.
-type CheckerDefaults struct{}
+// SinkStatus represents stats about each Sink instance.
+type SinkStatus struct {
+	// DroppedCount is the number of trace points dropped.
+	DroppedCount uint64
+}
 
-var _ Checker = (*CheckerDefaults)(nil)
+// SinkDefaults may be embedded by implementations of Sink to obtain
+// no-op implementations of Sink methods that may be explicitly overridden.
+type SinkDefaults struct{}
 
-// Clone implements Checker.Clone.
-func (CheckerDefaults) Clone(context.Context, FieldSet, *pb.CloneInfo) error {
+// Add functions missing in SinkDefaults to make it possible to check for the
+// implementation below to catch missing functions more easily.
+type sinkDefaultsImpl struct {
+	SinkDefaults
+}
+
+// Name implements Sink.Name.
+func (sinkDefaultsImpl) Name() string { return "" }
+
+var _ Sink = (*sinkDefaultsImpl)(nil)
+
+// Status implements Sink.Status.
+func (SinkDefaults) Status() SinkStatus {
+	return SinkStatus{}
+}
+
+// Stop implements Sink.Stop.
+func (SinkDefaults) Stop() {}
+
+// Clone implements Sink.Clone.
+func (SinkDefaults) Clone(context.Context, FieldSet, *pb.CloneInfo) error {
 	return nil
 }
 
-// Execve implements Checker.Execve.
-func (CheckerDefaults) Execve(context.Context, FieldSet, *pb.ExecveInfo) error {
+// Execve implements Sink.Execve.
+func (SinkDefaults) Execve(context.Context, FieldSet, *pb.ExecveInfo) error {
 	return nil
 }
 
-// ExitNotifyParent implements Checker.ExitNotifyParent.
-func (CheckerDefaults) ExitNotifyParent(context.Context, FieldSet, *pb.ExitNotifyParentInfo) error {
+// ExitNotifyParent implements Sink.ExitNotifyParent.
+func (SinkDefaults) ExitNotifyParent(context.Context, FieldSet, *pb.ExitNotifyParentInfo) error {
 	return nil
 }
 
-// PointReq indicates what Point a corresponding Checker runs at, and what
+// ContainerStart implements Sink.ContainerStart.
+func (SinkDefaults) ContainerStart(context.Context, FieldSet, *pb.Start) error {
+	return nil
+}
+
+// TaskExit implements Sink.TaskExit.
+func (SinkDefaults) TaskExit(context.Context, FieldSet, *pb.TaskExit) error {
+	return nil
+}
+
+// RawSyscall implements Sink.RawSyscall.
+func (SinkDefaults) RawSyscall(context.Context, FieldSet, *pb.Syscall) error {
+	return nil
+}
+
+// Syscall implements Sink.Syscall.
+func (SinkDefaults) Syscall(context.Context, FieldSet, *pb.ContextData, pb.MessageType, proto.Message) error {
+	return nil
+}
+
+// PointReq indicates what Point a corresponding Sink runs at, and what
 // information it requires at those Points.
 type PointReq struct {
 	Pt     Point
@@ -152,63 +191,126 @@ var Global State
 
 // State is the type of global, and is separated out for testing.
 type State struct {
-	// registrationMu serializes all changes to the set of registered Checkers
+	// registrationMu serializes all changes to the set of registered Sinks
 	// for all checkpoints.
 	registrationMu sync.RWMutex
 
-	// enabledPoints is a bitmask of checkpoints for which at least one Checker
+	// enabledPoints is a bitmask of checkpoints for which at least one Sink
 	// is registered.
 	//
-	// enabledPoints is accessed using atomic memory operations. Mutation of
-	// enabledPoints is serialized by registrationMu.
-	enabledPoints [numPointBitmaskUint32s]uint32
+	// Mutation of enabledPoints is serialized by registrationMu.
+	enabledPoints [numPointBitmaskUint32s]atomicbitops.Uint32
 
-	// registrationSeq supports store-free atomic reads of registeredCheckers.
+	// registrationSeq supports store-free atomic reads of registeredSinks.
 	registrationSeq sync.SeqCount
 
-	// checkers is the set of all registered Checkers in order of execution.
+	// sinks is the set of all registered Sinks in order of execution.
 	//
-	// checkers is accessed using instantiations of SeqAtomic functions.
-	// Mutation of checkers is serialized by registrationMu.
-	checkers []Checker
+	// sinks is accessed using instantiations of SeqAtomic functions.
+	// Mutation of sinks is serialized by registrationMu.
+	sinks []Sink
+
+	// syscallFlagListeners is the set of registered SyscallFlagListeners.
+	//
+	// They are notified when the enablement of a syscall point changes.
+	// Mutation of syscallFlagListeners is serialized by registrationMu.
+	syscallFlagListeners []SyscallFlagListener
 
 	pointFields map[Point]FieldSet
 }
 
-// AppendChecker registers the given Checker to execute at checkpoints. The
-// Checker will execute after all previously-registered Checkers, and only if
-// those Checkers return a nil error.
-func (s *State) AppendChecker(c Checker, reqs []PointReq) {
+// AppendSink registers the given Sink to execute at checkpoints. The
+// Sink will execute after all previously-registered sinks, and only if
+// those Sinks return a nil error.
+func (s *State) AppendSink(c Sink, reqs []PointReq) {
 	s.registrationMu.Lock()
 	defer s.registrationMu.Unlock()
 
-	s.appendCheckerLocked(c)
+	s.appendSinkLocked(c)
 	if s.pointFields == nil {
 		s.pointFields = make(map[Point]FieldSet)
 	}
+	updateSyscalls := false
 	for _, req := range reqs {
-		word, bit := req.Pt/32, req.Pt%32
-		atomic.StoreUint32(&s.enabledPoints[word], s.enabledPoints[word]|(uint32(1)<<bit))
-
+		word, bit := req.Pt/numPointsPerUint32, req.Pt%numPointsPerUint32
+		s.enabledPoints[word].Store(s.enabledPoints[word].RacyLoad() | (uint32(1) << bit))
+		if req.Pt >= pointLengthBeforeSyscalls {
+			updateSyscalls = true
+		}
 		s.pointFields[req.Pt] = req.Fields
+	}
+	if updateSyscalls {
+		for _, listener := range s.syscallFlagListeners {
+			listener.UpdateSecCheck(s)
+		}
 	}
 }
 
-// Enabled returns true if any Checker is registered for the given checkpoint.
-func (s *State) Enabled(p Point) bool {
-	word, bit := p/32, p%32
-	return atomic.LoadUint32(&s.enabledPoints[word])&(uint32(1)<<bit) != 0
+func (s *State) clearSink() {
+	s.registrationMu.Lock()
+	defer s.registrationMu.Unlock()
+
+	updateSyscalls := false
+	for i := range s.enabledPoints {
+		s.enabledPoints[i].Store(0)
+		// We use i+1 here because we want to check the last bit that may have been changed within i.
+		if Point((i+1)*numPointsPerUint32) >= pointLengthBeforeSyscalls {
+			updateSyscalls = true
+		}
+	}
+	if updateSyscalls {
+		for _, listener := range s.syscallFlagListeners {
+			listener.UpdateSecCheck(s)
+		}
+	}
+	s.pointFields = nil
+
+	oldSinks := s.getSinks()
+	s.registrationSeq.BeginWrite()
+	s.sinks = nil
+	s.registrationSeq.EndWrite()
+	for _, sink := range oldSinks {
+		sink.Stop()
+	}
 }
 
-func (s *State) getCheckers() []Checker {
-	return SeqAtomicLoadCheckerSlice(&s.registrationSeq, &s.checkers)
+// AddSyscallFlagListener adds a listener to the State.
+//
+// The listener will be notified whenever syscall point enablement changes.
+func (s *State) AddSyscallFlagListener(listener SyscallFlagListener) {
+	s.registrationMu.Lock()
+	defer s.registrationMu.Unlock()
+	s.syscallFlagListeners = append(s.syscallFlagListeners, listener)
+}
+
+// Enabled returns true if any Sink is registered for the given checkpoint.
+func (s *State) Enabled(p Point) bool {
+	word, bit := p/numPointsPerUint32, p%numPointsPerUint32
+	if int(word) >= len(s.enabledPoints) {
+		return false
+	}
+	return s.enabledPoints[word].Load()&(uint32(1)<<bit) != 0
+}
+
+func (s *State) getSinks() []Sink {
+	return SeqAtomicLoadSinkSlice(&s.registrationSeq, &s.sinks)
 }
 
 // Preconditions: s.registrationMu must be locked.
-func (s *State) appendCheckerLocked(c Checker) {
+func (s *State) appendSinkLocked(c Sink) {
 	s.registrationSeq.BeginWrite()
-	s.checkers = append(s.checkers, c)
+	s.sinks = append(s.sinks, c)
 	s.registrationSeq.EndWrite()
+}
+
+// SentToSinks iterates over all sinks and calls fn for each one of them.
+func (s *State) SentToSinks(fn func(c Sink) error) error {
+	for _, c := range s.getSinks() {
+		if err := fn(c); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // GetFieldSet returns the FieldSet that has been configured for a given Point.

@@ -37,10 +37,10 @@ import (
 // RPC concurrency.
 //
 // Reference model:
-// * When any FD is created, the connection takes a ref on it which represents
-//   the client's ref on the FD.
-// * The client can drop its ref via the Close RPC which will in turn make the
-//   connection drop its ref.
+//   - When any FD is created, the connection takes a ref on it which represents
+//     the client's ref on the FD.
+//   - The client can drop its ref via the Close RPC which will in turn make the
+//     connection drop its ref.
 type Connection struct {
 	// server is the server on which this connection was created. It is immutably
 	// associated with it for its entire lifetime.
@@ -297,6 +297,22 @@ func (c *Connection) lookupOpenFD(id FDID) (*OpenFD, error) {
 	return ofd, nil
 }
 
+// lookupBoundSocketFD retrieves the boundSockedFD identified by id on this
+// connection. On success, the caller gains a ref on the FD.
+func (c *Connection) lookupBoundSocketFD(id FDID) (*BoundSocketFD, error) {
+	fd, err := c.lookupFD(id)
+	if err != nil {
+		return nil, err
+	}
+
+	bsfd, ok := fd.(*BoundSocketFD)
+	if !ok {
+		fd.DecRef(nil)
+		return nil, unix.EINVAL
+	}
+	return bsfd, nil
+}
+
 // insertFD inserts the passed fd into the internal datastructure to track FDs.
 // The caller must hold a ref on fd which is transferred to the connection.
 func (c *Connection) insertFD(fd genericFD) FDID {
@@ -327,8 +343,8 @@ func (c *Connection) removeFD(id FDID) {
 // removeControlFDLocked is the same as removeFD with added preconditions.
 //
 // Preconditions:
-// * server's rename mutex must at least be read locked.
-// * id must be pointing to a control FD.
+//   - server's rename mutex must at least be read locked.
+//   - id must be pointing to a control FD.
 func (c *Connection) removeControlFDLocked(id FDID) {
 	c.fdsMu.Lock()
 	fd := c.stopTrackingFD(id)

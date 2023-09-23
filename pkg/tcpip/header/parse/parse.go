@@ -19,7 +19,6 @@ import (
 	"fmt"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
@@ -28,7 +27,7 @@ import (
 // pkt.Data.
 //
 // Returns true if the header was successfully parsed.
-func ARP(pkt *stack.PacketBuffer) bool {
+func ARP(pkt stack.PacketBufferPtr) bool {
 	_, ok := pkt.NetworkHeader().Consume(header.ARPSize)
 	if ok {
 		pkt.NetworkProtocolNumber = header.ARPProtocolNumber
@@ -40,7 +39,7 @@ func ARP(pkt *stack.PacketBuffer) bool {
 // header with the IPv4 header.
 //
 // Returns true if the header was successfully parsed.
-func IPv4(pkt *stack.PacketBuffer) bool {
+func IPv4(pkt stack.PacketBufferPtr) bool {
 	hdr, ok := pkt.Data().PullUp(header.IPv4MinimumSize)
 	if !ok {
 		return false
@@ -72,7 +71,7 @@ func IPv4(pkt *stack.PacketBuffer) bool {
 
 // IPv6 parses an IPv6 packet found in pkt.Data and populates pkt's network
 // header with the IPv6 header.
-func IPv6(pkt *stack.PacketBuffer) (proto tcpip.TransportProtocolNumber, fragID uint32, fragOffset uint16, fragMore bool, ok bool) {
+func IPv6(pkt stack.PacketBufferPtr) (proto tcpip.TransportProtocolNumber, fragID uint32, fragOffset uint16, fragMore bool, ok bool) {
 	hdr, ok := pkt.Data().PullUp(header.IPv6MinimumSize)
 	if !ok {
 		return 0, 0, 0, false, false
@@ -81,18 +80,17 @@ func IPv6(pkt *stack.PacketBuffer) (proto tcpip.TransportProtocolNumber, fragID 
 
 	// Create a VV to parse the packet. We don't plan to modify anything here.
 	// dataVV consists of:
-	// - Any IPv6 header bytes after the first 40 (i.e. extensions).
-	// - The transport header, if present.
-	// - Any other payload data.
-	views := [8]buffer.View{}
-	dataVV := buffer.NewVectorisedView(0, views[:0])
-	dataVV.AppendViews(pkt.Data().Views())
-	dataVV.TrimFront(header.IPv6MinimumSize)
-	it := header.MakeIPv6PayloadIterator(header.IPv6ExtensionHeaderIdentifier(ipHdr.NextHeader()), dataVV)
+	//	- Any IPv6 header bytes after the first 40 (i.e. extensions).
+	//	- The transport header, if present.
+	//	- Any other payload data.
+	dataBuf := pkt.Data().ToBuffer()
+	dataBuf.TrimFront(header.IPv6MinimumSize)
+	it := header.MakeIPv6PayloadIterator(header.IPv6ExtensionHeaderIdentifier(ipHdr.NextHeader()), dataBuf)
+	defer it.Release()
 
 	// Iterate over the IPv6 extensions to find their length.
 	var nextHdr tcpip.TransportProtocolNumber
-	var extensionsSize int
+	var extensionsSize int64
 
 traverseExtensions:
 	for {
@@ -104,7 +102,7 @@ traverseExtensions:
 		// If we exhaust the extension list, the entire packet is the IPv6 header
 		// and (possibly) extensions.
 		if done {
-			extensionsSize = dataVV.Size()
+			extensionsSize = dataBuf.Size()
 			break
 		}
 
@@ -126,22 +124,25 @@ traverseExtensions:
 				fragMore = extHdr.More()
 			}
 			rawPayload := it.AsRawHeader(true /* consume */)
-			extensionsSize = dataVV.Size() - rawPayload.Buf.Size()
+			extensionsSize = dataBuf.Size() - rawPayload.Buf.Size()
+			rawPayload.Release()
+			extHdr.Release()
 			break traverseExtensions
 
 		case header.IPv6RawPayloadHeader:
 			// We've found the payload after any extensions.
-			extensionsSize = dataVV.Size() - extHdr.Buf.Size()
+			extensionsSize = dataBuf.Size() - extHdr.Buf.Size()
 			nextHdr = tcpip.TransportProtocolNumber(extHdr.Identifier)
+			extHdr.Release()
 			break traverseExtensions
-
 		default:
+			extHdr.Release()
 			// Any other extension is a no-op, keep looping until we find the payload.
 		}
 	}
 
 	// Put the IPv6 header with extensions in pkt.NetworkHeader().
-	hdr, ok = pkt.NetworkHeader().Consume(header.IPv6MinimumSize + extensionsSize)
+	hdr, ok = pkt.NetworkHeader().Consume(header.IPv6MinimumSize + int(extensionsSize))
 	if !ok {
 		panic(fmt.Sprintf("pkt.Data should have at least %d bytes, but only has %d.", header.IPv6MinimumSize+extensionsSize, pkt.Data().Size()))
 	}
@@ -156,7 +157,7 @@ traverseExtensions:
 // header with the UDP header.
 //
 // Returns true if the header was successfully parsed.
-func UDP(pkt *stack.PacketBuffer) bool {
+func UDP(pkt stack.PacketBufferPtr) bool {
 	_, ok := pkt.TransportHeader().Consume(header.UDPMinimumSize)
 	pkt.TransportProtocolNumber = header.UDPProtocolNumber
 	return ok
@@ -166,7 +167,7 @@ func UDP(pkt *stack.PacketBuffer) bool {
 // header with the TCP header.
 //
 // Returns true if the header was successfully parsed.
-func TCP(pkt *stack.PacketBuffer) bool {
+func TCP(pkt stack.PacketBufferPtr) bool {
 	// TCP header is variable length, peek at it first.
 	hdrLen := header.TCPMinimumSize
 	hdr, ok := pkt.Data().PullUp(hdrLen)
@@ -190,7 +191,7 @@ func TCP(pkt *stack.PacketBuffer) bool {
 // if present.
 //
 // Returns true if an ICMPv4 header was successfully parsed.
-func ICMPv4(pkt *stack.PacketBuffer) bool {
+func ICMPv4(pkt stack.PacketBufferPtr) bool {
 	if _, ok := pkt.TransportHeader().Consume(header.ICMPv4MinimumSize); ok {
 		pkt.TransportProtocolNumber = header.ICMPv4ProtocolNumber
 		return true
@@ -202,7 +203,7 @@ func ICMPv4(pkt *stack.PacketBuffer) bool {
 // if present.
 //
 // Returns true if an ICMPv6 header was successfully parsed.
-func ICMPv6(pkt *stack.PacketBuffer) bool {
+func ICMPv6(pkt stack.PacketBufferPtr) bool {
 	hdr, ok := pkt.Data().PullUp(header.ICMPv6MinimumSize)
 	if !ok {
 		return false
@@ -214,17 +215,14 @@ func ICMPv6(pkt *stack.PacketBuffer) bool {
 		header.ICMPv6RouterAdvert,
 		header.ICMPv6NeighborSolicit,
 		header.ICMPv6NeighborAdvert,
-		header.ICMPv6RedirectMsg:
+		header.ICMPv6RedirectMsg,
+		header.ICMPv6MulticastListenerQuery,
+		header.ICMPv6MulticastListenerReport,
+		header.ICMPv6MulticastListenerV2Report,
+		header.ICMPv6MulticastListenerDone:
 		size := pkt.Data().Size()
 		if _, ok := pkt.TransportHeader().Consume(size); !ok {
 			panic(fmt.Sprintf("expected to consume the full data of size = %d bytes into transport header", size))
-		}
-	case header.ICMPv6MulticastListenerQuery,
-		header.ICMPv6MulticastListenerReport,
-		header.ICMPv6MulticastListenerDone:
-		size := header.ICMPv6HeaderSize + header.MLDMinimumSize
-		if _, ok := pkt.TransportHeader().Consume(size); !ok {
-			return false
 		}
 	case header.ICMPv6DstUnreachable,
 		header.ICMPv6PacketTooBig,

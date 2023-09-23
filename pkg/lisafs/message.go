@@ -31,10 +31,10 @@ import (
 // "dataLen" refers to the size of both combined.
 //
 // All messages must implement the following functions:
-// * marshal.Marshallable.SizeBytes
-// * marshal.Marshallable.Marshal{Unsafe/Bytes}
-// * marshal.CheckedMarshallable.CheckedUnmarshal
-// * fmt.Stringer.String
+//	* marshal.Marshallable.SizeBytes
+//	* marshal.Marshallable.Marshal{Unsafe/Bytes}
+//	* marshal.CheckedMarshallable.CheckedUnmarshal
+//	* fmt.Stringer.String
 //
 // There is no explicit interface definition for this because that definition
 // will not be used anywhere. If a concrete type is passed into a function
@@ -52,7 +52,7 @@ import (
 //
 // String() implementations must ensure that the message struct doesn't escape.
 // For instance, directly passing the struct to fmt.Sprintf() escapes it
-// because of the implicit conversion to interface{}.
+// because of the implicit conversion to any.
 
 type marshalFunc func([]byte) []byte
 type unmarshalFunc func([]byte) ([]byte, bool)
@@ -163,6 +163,15 @@ const (
 
 	// FRemoveXattr is analogous to fremovexattr(2).
 	FRemoveXattr MID = 28
+
+	// BindAt is analogous to bind(2).
+	BindAt MID = 29
+
+	// Listen is analogous to listen(2).
+	Listen MID = 30
+
+	// Accept is analogous to accept4(2).
+	Accept MID = 31
 )
 
 const (
@@ -261,9 +270,7 @@ type StringArray []string
 func (s *StringArray) String() string {
 	var b strings.Builder
 	b.WriteString("[")
-	for _, str := range *s {
-		b.WriteString(fmt.Sprintf("%s, ", str))
-	}
+	b.WriteString(strings.Join(*s, ", "))
 	b.WriteString("]")
 	return b.String()
 }
@@ -322,7 +329,11 @@ type Inode struct {
 	Stat      linux.Statx
 }
 
-// MountReq is an empty requent to Mount on the connection.
+func (i *Inode) String() string {
+	return fmt.Sprintf("Inode{ControlFD: %d, Stat: %s}", i.ControlFD, i.Stat.String())
+}
+
+// MountReq is an empty request to Mount on the connection.
 type MountReq struct{ EmptyMessage }
 
 // String implements fmt.Stringer.String.
@@ -342,7 +353,7 @@ type MountResp struct {
 
 // String implements fmt.Stringer.String.
 func (m *MountResp) String() string {
-	return fmt.Sprintf("MountResp{Root: %+v, MaxMessageSize: %d, SupportedMs: %+v}", m.Root, m.MaxMessageSize, m.SupportedMs)
+	return fmt.Sprintf("MountResp{Root: %s, MaxMessageSize: %d, SupportedMs: %+v}", m.Root.String(), m.MaxMessageSize, m.SupportedMs)
 }
 
 // SizeBytes implements marshal.Marshallable.SizeBytes.
@@ -444,8 +455,8 @@ type SetStatReq struct {
 
 // String implements fmt.Stringer.String.
 func (s *SetStatReq) String() string {
-	return fmt.Sprintf("SetStatReq{FD: %d, Mask: %d, Mode: %d, UID: %d, GID: %d, Size: %d, Atime: %+v, Mtime: %+v}",
-		s.FD, s.Mask, s.Mode, s.UID, s.GID, s.Size, s.Atime, s.Mtime)
+	return fmt.Sprintf("SetStatReq{FD: %d, Mask: %#x, Mode: %d, UID: %d, GID: %d, Size: %d, Atime: %s, Mtime: %s}",
+		s.FD, s.Mask, s.Mode, s.UID, s.GID, s.Size, s.Atime.ToTime(), s.Mtime.ToTime())
 }
 
 // SetStatResp is used to communicate SetStat results. It contains a mask
@@ -461,7 +472,7 @@ type SetStatResp struct {
 
 // String implements fmt.Stringer.String.
 func (s *SetStatResp) String() string {
-	return fmt.Sprintf("SetStatResp{FailureMask: %d, FailureErrNo: %d}", s.FailureMask, s.FailureErrNo)
+	return fmt.Sprintf("SetStatResp{FailureMask: %#x, FailureErrNo: %d}", s.FailureMask, s.FailureErrNo)
 }
 
 // WalkReq is used to request to walk multiple path components at once. This
@@ -521,6 +532,19 @@ const (
 	WalkComponentSymlink
 )
 
+func walkStatusToString(ws WalkStatus) string {
+	switch ws {
+	case WalkSuccess:
+		return "Success"
+	case WalkComponentDoesNotExist:
+		return "ComponentDoesNotExist"
+	case WalkComponentSymlink:
+		return "ComponentSymlink"
+	default:
+		panic(fmt.Sprintf("Unknown WalkStatus: %d", ws))
+	}
+}
+
 // WalkResp is used to communicate the inodes walked by the server. In memory,
 // the inode array is preceded by a uint16 integer denoting array length.
 type WalkResp struct {
@@ -535,10 +559,13 @@ func (w *WalkResp) String() string {
 	var arrB strings.Builder
 	arrB.WriteString("[")
 	for i := range w.Inodes {
-		arrB.WriteString(fmt.Sprintf("%+v, ", w.Inodes[i]))
+		if i > 0 {
+			arrB.WriteString(", ")
+		}
+		arrB.WriteString(w.Inodes[i].String())
 	}
 	arrB.WriteString("]")
-	return fmt.Sprintf("WalkResp{Status: %d, Inodes: %s}", w.Status, arrB.String())
+	return fmt.Sprintf("WalkResp{Status: %s, Inodes: %s}", walkStatusToString(w.Status), arrB.String())
 }
 
 // SizeBytes implements marshal.Marshallable.SizeBytes.
@@ -586,7 +613,16 @@ type WalkStatResp struct {
 
 // String implements fmt.Stringer.String.
 func (w *WalkStatResp) String() string {
-	return fmt.Sprintf("WalkStatResp{Stats: %+v}", w.Stats)
+	var arrB strings.Builder
+	arrB.WriteString("[")
+	for i := range w.Stats {
+		if i > 0 {
+			arrB.WriteString(", ")
+		}
+		arrB.WriteString(w.Stats[i].String())
+	}
+	arrB.WriteString("]")
+	return fmt.Sprintf("WalkStatResp{Stats: %s}", arrB.String())
 }
 
 // SizeBytes implements marshal.Marshallable.SizeBytes.
@@ -633,7 +669,7 @@ type OpenAtReq struct {
 
 // String implements fmt.Stringer.String.
 func (o *OpenAtReq) String() string {
-	return fmt.Sprintf("OpenAtReq{FD: %d, Flags: %d}", o.FD, o.Flags)
+	return fmt.Sprintf("OpenAtReq{FD: %d, Flags: %#o}", o.FD, o.Flags)
 }
 
 // OpenAtResp is used to communicate the newly created FD.
@@ -668,7 +704,7 @@ type OpenCreateAtReq struct {
 
 // String implements fmt.Stringer.String.
 func (o *OpenCreateAtReq) String() string {
-	return fmt.Sprintf("OpenCreateAtReq{DirFD: %d, Mode: %s, UID: %d, GID: %d, Flags: %d, Name: %s}", o.DirFD, o.Mode, o.UID, o.GID, o.Flags, o.Name)
+	return fmt.Sprintf("OpenCreateAtReq{DirFD: %d, Mode: %s, UID: %d, GID: %d, Flags: %#o, Name: %s}", o.DirFD, o.Mode, o.UID, o.GID, o.Flags, o.Name)
 }
 
 // SizeBytes implements marshal.Marshallable.SizeBytes.
@@ -707,7 +743,7 @@ type OpenCreateAtResp struct {
 
 // String implements fmt.Stringer.String.
 func (o *OpenCreateAtResp) String() string {
-	return fmt.Sprintf("OpenCreateAtResp{Child: %+v, NewFD: %d}", o.Child, o.NewFD)
+	return fmt.Sprintf("OpenCreateAtResp{Child: %s, NewFD: %d}", o.Child.String(), o.NewFD)
 }
 
 // FdArray is a utility struct which implements a marshallable type for
@@ -721,8 +757,11 @@ type FdArray []FDID
 func (f *FdArray) String() string {
 	var b strings.Builder
 	b.WriteString("[")
-	for _, fd := range *f {
-		b.WriteString(fmt.Sprintf("%d, ", fd))
+	for i, fd := range *f {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(fmt.Sprintf("%d", fd))
 	}
 	b.WriteString("]")
 	return b.String()
@@ -848,7 +887,7 @@ type PReadResp struct {
 
 // String implements fmt.Stringer.String.
 func (r *PReadResp) String() string {
-	return fmt.Sprintf("PReadResp{NumBytes: %d, Buf: %v}", r.NumBytes, r.Buf)
+	return fmt.Sprintf("PReadResp{NumBytes: %d, Buf: [...%d bytes...]}", r.NumBytes, len(r.Buf))
 }
 
 // SizeBytes implements marshal.Marshallable.SizeBytes.
@@ -871,7 +910,8 @@ func (r *PReadResp) CheckedUnmarshal(src []byte) ([]byte, bool) {
 
 	// We expect the client to have already allocated r.Buf. r.Buf probably
 	// (optimally) points to usermem. Directly copy into that.
-	return srcRemain[copy(r.Buf[:r.NumBytes], srcRemain[:r.NumBytes]):], true
+	r.Buf = r.Buf[:r.NumBytes]
+	return srcRemain[copy(r.Buf, srcRemain[:r.NumBytes]):], true
 }
 
 // PWriteReq is used to pwrite(2) on an FD.
@@ -884,7 +924,7 @@ type PWriteReq struct {
 
 // String implements fmt.Stringer.String.
 func (w *PWriteReq) String() string {
-	return fmt.Sprintf("PWriteReq{Offset: %d, FD: %d, NumBytes: %d, Buf: %v}", w.Offset, w.FD, w.NumBytes, w.Buf)
+	return fmt.Sprintf("PWriteReq{Offset: %d, FD: %d, NumBytes: %d, Buf: [...%d bytes...]}", w.Offset, w.FD, w.NumBytes, len(w.Buf))
 }
 
 // SizeBytes implements marshal.Marshallable.SizeBytes.
@@ -975,7 +1015,7 @@ type MkdirAtResp struct {
 
 // String implements fmt.Stringer.String.
 func (m *MkdirAtResp) String() string {
-	return fmt.Sprintf("MkdirAtResp{ChildDir: %+v}", m.ChildDir)
+	return fmt.Sprintf("MkdirAtResp{ChildDir: %s}", m.ChildDir.String())
 }
 
 // MknodAtReq is used to make MknodAt requests.
@@ -1028,7 +1068,7 @@ type MknodAtResp struct {
 
 // String implements fmt.Stringer.String.
 func (m *MknodAtResp) String() string {
-	return fmt.Sprintf("MknodAtResp{Child: %+v}", m.Child)
+	return fmt.Sprintf("MknodAtResp{Child: %s}", m.Child.String())
 }
 
 // SymlinkAtReq is used to make SymlinkAt request.
@@ -1088,7 +1128,7 @@ type SymlinkAtResp struct {
 
 // String implements fmt.Stringer.String.
 func (s *SymlinkAtResp) String() string {
-	return fmt.Sprintf("SymlinkAtResp{Symlink: %+v}", s.Symlink)
+	return fmt.Sprintf("SymlinkAtResp{Symlink: %s}", s.Symlink.String())
 }
 
 // LinkAtReq is used to make LinkAt requests.
@@ -1138,7 +1178,7 @@ type LinkAtResp struct {
 
 // String implements fmt.Stringer.String.
 func (l *LinkAtResp) String() string {
-	return fmt.Sprintf("LinkAtResp{Link: %+v}", l.Link)
+	return fmt.Sprintf("LinkAtResp{Link: %s}", l.Link.String())
 }
 
 // FStatFSReq is used to request StatFS results for the specified FD.
@@ -1278,6 +1318,116 @@ func (*ConnectResp) String() string {
 	return "ConnectResp{}"
 }
 
+// BindAtReq is used to make BindAt requests.
+type BindAtReq struct {
+	createCommon
+	SockType primitive.Uint32
+	Name     SizedString
+}
+
+// SizeBytes implements marshal.Marshallable.SizeBytes.
+func (b *BindAtReq) SizeBytes() int {
+	return b.createCommon.SizeBytes() + b.SockType.SizeBytes() + b.Name.SizeBytes()
+}
+
+// MarshalBytes implements marshal.Marshallable.MarshalBytes.
+func (b *BindAtReq) MarshalBytes(dst []byte) []byte {
+	dst = b.createCommon.MarshalUnsafe(dst)
+	dst = b.SockType.MarshalUnsafe(dst)
+	return b.Name.MarshalBytes(dst)
+}
+
+// CheckedUnmarshal implements marshal.CheckedMarshallable.CheckedUnmarshal.
+func (b *BindAtReq) CheckedUnmarshal(src []byte) ([]byte, bool) {
+	b.Name = ""
+	if b.SizeBytes() > len(src) {
+		return src, false
+	}
+	srcRemain := b.createCommon.UnmarshalUnsafe(src)
+	srcRemain = b.SockType.UnmarshalUnsafe(srcRemain)
+	if srcRemain, ok := b.Name.CheckedUnmarshal(srcRemain); ok {
+		return srcRemain, ok
+	}
+	return src, false
+}
+
+// String implements fmt.Stringer.String.
+func (b *BindAtReq) String() string {
+	return fmt.Sprintf("BindAtReq{DirFD: %d, Mode: %s, UID: %d, GID: %d, SockType: %d, Name: %q}", b.DirFD, b.Mode, b.UID, b.GID, b.SockType, b.Name)
+}
+
+// BindAtResp is used to communicate BindAt response.
+//
+// +marshal boundCheck
+type BindAtResp struct {
+	Child         Inode
+	BoundSocketFD FDID
+}
+
+// String implements fmt.Stringer.String.
+func (b *BindAtResp) String() string {
+	return fmt.Sprintf("BindAtResp{Child: %s, BoundSocketFD: %d}", b.Child.String(), b.BoundSocketFD)
+}
+
+// ListenReq is used to make Listen requests.
+//
+// +marshal boundCheck
+type ListenReq struct {
+	FD      FDID
+	Backlog int32
+	_       uint32
+}
+
+// String implements fmt.Stringer.String.
+func (l *ListenReq) String() string {
+	return fmt.Sprintf("ListenReq{FD: %v, Backlog: %d}", l.FD, l.Backlog)
+}
+
+// ListenResp is an empty response to ListenResp.
+type ListenResp struct{ EmptyMessage }
+
+// String implements fmt.Stringer.String.
+func (*ListenResp) String() string {
+	return "ListenResp{}"
+}
+
+// AcceptReq is used to make AcceptRequests.
+//
+// +marshal boundCheck
+type AcceptReq struct {
+	FD FDID
+}
+
+// String implements fmt.Stringer.String.
+func (a *AcceptReq) String() string {
+	return fmt.Sprintf("AcceptReq{FD: %v}", a.FD)
+}
+
+// AcceptResp is an empty response to AcceptResp.
+type AcceptResp struct {
+	PeerAddr SizedString
+}
+
+// String implements fmt.Stringer.String.
+func (a *AcceptResp) String() string {
+	return fmt.Sprintf("AcceptResp{PeerAddr: %s}", a.PeerAddr)
+}
+
+// SizeBytes implements marshal.Marshallable.SizeBytes.
+func (a *AcceptResp) SizeBytes() int {
+	return a.PeerAddr.SizeBytes()
+}
+
+// MarshalBytes implements marshal.Marshallable.MarshalBytes.
+func (a *AcceptResp) MarshalBytes(dst []byte) []byte {
+	return a.PeerAddr.MarshalBytes(dst)
+}
+
+// CheckedUnmarshal implements marshal.CheckedMarshallable.CheckedUnmarshal.
+func (a *AcceptResp) CheckedUnmarshal(src []byte) ([]byte, bool) {
+	return a.PeerAddr.CheckedUnmarshal(src)
+}
+
 // UnlinkAtReq is used to make UnlinkAt request.
 type UnlinkAtReq struct {
 	DirFD FDID
@@ -1287,7 +1437,7 @@ type UnlinkAtReq struct {
 
 // String implements fmt.Stringer.String.
 func (u *UnlinkAtReq) String() string {
-	return fmt.Sprintf("UnlinkAtReq{DirFD: %d, Flags: %d, Name: %s}", u.DirFD, u.Flags, u.Name)
+	return fmt.Sprintf("UnlinkAtReq{DirFD: %d, Flags: %#x, Name: %s}", u.DirFD, u.Flags, u.Name)
 }
 
 // SizeBytes implements marshal.Marshallable.SizeBytes.
@@ -1451,7 +1601,16 @@ type Getdents64Resp struct {
 
 // String implements fmt.Stringer.String.
 func (g *Getdents64Resp) String() string {
-	return fmt.Sprintf("Getdents64Resp{Dirents: %+v}", g.Dirents)
+	var b strings.Builder
+	b.WriteString("[")
+	for i, dirent := range g.Dirents {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(dirent.String())
+	}
+	b.WriteString("]")
+	return fmt.Sprintf("Getdents64Resp{Dirents: %s}", b.String())
 }
 
 // SizeBytes implements marshal.Marshallable.SizeBytes.
@@ -1570,7 +1729,7 @@ type FSetXattrReq struct {
 
 // String implements fmt.Stringer.String.
 func (s *FSetXattrReq) String() string {
-	return fmt.Sprintf("FSetXattrReq{FD: %d, Flags: %d, Name: %s, Value: %s}", s.FD, s.Flags, s.Name, s.Value)
+	return fmt.Sprintf("FSetXattrReq{FD: %d, Flags: %#x, Name: %s, Value: %s}", s.FD, s.Flags, s.Name, s.Value)
 }
 
 // SizeBytes implements marshal.Marshallable.SizeBytes.

@@ -18,12 +18,12 @@ import (
 	"fmt"
 	"runtime"
 	"runtime/trace"
-	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/goid"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/hostcpu"
 	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -59,6 +59,9 @@ type taskRunState interface {
 func (t *Task) run(threadID uintptr) {
 	t.goid.Store(goid.Get())
 
+	refs.CleanupSync.Add(1)
+	defer refs.CleanupSync.Done()
+
 	// Construct t.blockingTimer here. We do this here because we can't
 	// reconstruct t.blockingTimer during restore in Task.afterLoad(), because
 	// kernel.timekeeper.SetClocks() hasn't been called yet.
@@ -83,14 +86,14 @@ func (t *Task) run(threadID uintptr) {
 	for {
 		// Explanation for this ordering:
 		//
-		// - A freshly-started task that is stopped should not do anything
-		// before it enters the stop.
+		//	- A freshly-started task that is stopped should not do anything
+		//		before it enters the stop.
 		//
-		// - If taskRunState.execute returns nil, the task goroutine should
-		// exit without checking for a stop.
+		//	- If taskRunState.execute returns nil, the task goroutine should
+		//		exit without checking for a stop.
 		//
-		// - Task.Start won't start Task.run if t.runState is nil, so this
-		// ordering is safe.
+		//	- Task.Start won't start Task.run if t.runState is nil, so this
+		//		ordering is safe.
 		t.doStop()
 		t.runState = t.runState.execute(t)
 		if t.runState == nil {
@@ -113,7 +116,7 @@ func (t *Task) run(threadID uintptr) {
 
 // doStop is called by Task.run to block until the task is not stopped.
 func (t *Task) doStop() {
-	if atomic.LoadInt32(&t.stopCount) == 0 {
+	if t.stopCount.Load() == 0 {
 		return
 	}
 	t.Deactivate()
@@ -128,7 +131,7 @@ func (t *Task) doStop() {
 	defer t.tg.pidns.owner.runningGoroutines.Add(1)
 	t.goroutineStopped.Add(-1)
 	defer t.goroutineStopped.Add(1)
-	for t.stopCount > 0 {
+	for t.stopCount.RacyLoad() > 0 {
 		t.endStopCond.Wait()
 	}
 }
@@ -148,11 +151,11 @@ func (app *runApp) execute(t *Task) taskRunState {
 	}
 
 	// Execute any task work callbacks before returning to user space.
-	if atomic.LoadInt32(&t.taskWorkCount) > 0 {
+	if t.taskWorkCount.Load() > 0 {
 		t.taskWorkMu.Lock()
 		queue := t.taskWork
 		t.taskWork = nil
-		atomic.StoreInt32(&t.taskWorkCount, 0)
+		t.taskWorkCount.Store(0)
 		t.taskWorkMu.Unlock()
 
 		// Do not hold taskWorkMu while executing task work, which may register
@@ -169,6 +172,12 @@ func (app *runApp) execute(t *Task) taskRunState {
 	// a pending signal, causing another interruption, but that signal should
 	// not interact with the interrupted syscall.)
 	if t.haveSyscallReturn {
+		if err := t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch()); err != nil {
+			t.Warningf("Unable to pull a full state: %v", err)
+			t.PrepareExit(linux.WaitStatusExit(int32(ExtractErrno(err, -1))))
+			return (*runExit)(nil)
+		}
+
 		if sre, ok := linuxerr.SyscallRestartErrorFromReturn(t.Arch().Return()); ok {
 			if sre == linuxerr.ERESTART_RESTARTBLOCK {
 				t.Debugf("Restarting syscall %d with restart block: not interrupted by handled signal", t.Arch().SyscallNo())
@@ -247,6 +256,12 @@ func (app *runApp) execute(t *Task) taskRunState {
 	if clearSinglestep {
 		t.Arch().ClearSingleStep()
 	}
+	if t.hasTracer() {
+		if e := t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch()); e != nil {
+			t.Warningf("Unable to pull a full state: %v", e)
+			err = e
+		}
+	}
 
 	switch err {
 	case nil:
@@ -268,6 +283,8 @@ func (app *runApp) execute(t *Task) taskRunState {
 		// an application-generated signal and we should continue execution
 		// normally.
 		if at.Any() {
+			faultCounter.Increment()
+
 			region := trace.StartRegion(t.traceContext, faultRegion)
 			addr := hostarch.Addr(info.Addr())
 			err := t.MemoryManager().HandleUserFault(t, addr, at, hostarch.Addr(t.Arch().Stack()))

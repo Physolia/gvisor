@@ -59,15 +59,25 @@ func (e *Endpoint) MTU() uint32 {
 }
 
 // DeliverNetworkPacket implements stack.NetworkDispatcher.
-func (e *Endpoint) DeliverNetworkPacket(_ tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
-	hdr, ok := pkt.LinkHeader().Consume(header.EthernetMinimumSize)
-	if !ok {
+func (e *Endpoint) DeliverNetworkPacket(_ tcpip.NetworkProtocolNumber, pkt stack.PacketBufferPtr) {
+	if !e.ParseHeader(pkt) {
 		return
+	}
+	eth := header.Ethernet(pkt.LinkHeader().Slice())
+	dst := eth.DestinationAddress()
+	if dst == header.EthernetBroadcastAddress {
+		pkt.PktType = tcpip.PacketBroadcast
+	} else if header.IsMulticastEthernetAddress(dst) {
+		pkt.PktType = tcpip.PacketMulticast
+	} else if dst == e.LinkAddress() {
+		pkt.PktType = tcpip.PacketHost
+	} else {
+		pkt.PktType = tcpip.PacketOtherHost
 	}
 
 	// Note, there is no need to check the destination link address here since
 	// the ethernet hardware filters frames based on their destination addresses.
-	e.Endpoint.DeliverNetworkPacket(header.Ethernet(hdr).Type() /* protocol */, pkt)
+	e.Endpoint.DeliverNetworkPacket(eth.Type() /* protocol */, pkt)
 }
 
 // Capabilities implements stack.LinkEndpoint.
@@ -93,7 +103,7 @@ func (e *Endpoint) ARPHardwareType() header.ARPHardwareType {
 }
 
 // AddHeader implements stack.LinkEndpoint.
-func (*Endpoint) AddHeader(pkt *stack.PacketBuffer) {
+func (*Endpoint) AddHeader(pkt stack.PacketBufferPtr) {
 	eth := header.Ethernet(pkt.LinkHeader().Push(header.EthernetMinimumSize))
 	fields := header.EthernetFields{
 		SrcAddr: pkt.EgressRoute.LocalLinkAddress,
@@ -101,4 +111,10 @@ func (*Endpoint) AddHeader(pkt *stack.PacketBuffer) {
 		Type:    pkt.NetworkProtocolNumber,
 	}
 	eth.Encode(&fields)
+}
+
+// ParseHeader implements stack.LinkEndpoint.
+func (*Endpoint) ParseHeader(pkt stack.PacketBufferPtr) bool {
+	_, ok := pkt.LinkHeader().Consume(header.EthernetMinimumSize)
+	return ok
 }

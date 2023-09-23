@@ -18,22 +18,23 @@
 package fdbased
 
 import (
-	"fmt"
-
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/rawfile"
+	"gvisor.dev/gvisor/pkg/tcpip/link/stopfd"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
-// BufConfig defines the shape of the vectorised view used to read packets from the NIC.
+// BufConfig defines the shape of the buffer used to read packets from the NIC.
 var BufConfig = []int{128, 256, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768}
 
 type iovecBuffer struct {
-	// views are the actual buffers that hold the packet contents.
-	views []buffer.View
+	// buffer is the actual buffer that holds the packet contents. Some contents
+	// are reused across calls to pullBuffer if number of requested bytes is
+	// smaller than the number of bytes allocated in the buffer.
+	views []*buffer.View
 
 	// iovecs are initialized with base pointers/len of the corresponding
 	// entries in the views defined above, except when GSO is enabled
@@ -48,11 +49,16 @@ type iovecBuffer struct {
 
 	// skipsVnetHdr is true if virtioNetHdr is to skipped.
 	skipsVnetHdr bool
+
+	// pulledIndex is the index of the last []byte buffer pulled from the
+	// underlying buffer storage during a call to pullBuffers. It is -1
+	// if no buffer is pulled.
+	pulledIndex int
 }
 
 func newIovecBuffer(sizes []int, skipsVnetHdr bool) *iovecBuffer {
 	b := &iovecBuffer{
-		views:        make([]buffer.View, len(sizes)),
+		views:        make([]*buffer.View, len(sizes)),
 		sizes:        sizes,
 		skipsVnetHdr: skipsVnetHdr,
 	}
@@ -69,43 +75,49 @@ func (b *iovecBuffer) nextIovecs() []unix.Iovec {
 	if b.skipsVnetHdr {
 		var vnetHdr [virtioNetHdrSize]byte
 		// The kernel adds virtioNetHdr before each packet, but
-		// we don't use it, so so we allocate a buffer for it,
+		// we don't use it, so we allocate a buffer for it,
 		// add it in iovecs but don't add it in a view.
 		b.iovecs[0] = unix.Iovec{Base: &vnetHdr[0]}
 		b.iovecs[0].SetLen(virtioNetHdrSize)
 		vnetHdrOff++
 	}
+
 	for i := range b.views {
 		if b.views[i] != nil {
 			break
 		}
-		v := buffer.NewView(b.sizes[i])
+		v := buffer.NewViewSize(b.sizes[i])
 		b.views[i] = v
-		b.iovecs[i+vnetHdrOff] = unix.Iovec{Base: &v[0]}
-		b.iovecs[i+vnetHdrOff].SetLen(len(v))
+		b.iovecs[i+vnetHdrOff] = unix.Iovec{Base: v.BasePtr()}
+		b.iovecs[i+vnetHdrOff].SetLen(v.Size())
 	}
 	return b.iovecs
 }
 
-func (b *iovecBuffer) pullViews(n int) buffer.VectorisedView {
-	var views []buffer.View
+// pullBuffer extracts the enough underlying storage from b.buffer to hold n
+// bytes. It removes this storage from b.buffer, returns a new buffer
+// that holds the storage, and updates pulledIndex to indicate which part
+// of b.buffer's storage must be reallocated during the next call to
+// nextIovecs.
+func (b *iovecBuffer) pullBuffer(n int) buffer.Buffer {
+	var views []*buffer.View
 	c := 0
 	if b.skipsVnetHdr {
 		c += virtioNetHdrSize
 		if c >= n {
 			// Nothing in the packet.
-			return buffer.NewVectorisedView(0, nil)
+			return buffer.Buffer{}
 		}
 	}
+	// Remove the used views from the buffer.
 	for i, v := range b.views {
-		c += len(v)
+		c += v.Size()
 		if c >= n {
-			b.views[i].CapLength(len(v) - (c - n))
-			views = append([]buffer.View(nil), b.views[:i+1]...)
+			b.views[i].CapLength(v.Size() - (c - n))
+			views = append(views, b.views[:i+1]...)
 			break
 		}
 	}
-	// Remove the first len(views) used views from the state.
 	for i := range views {
 		b.views[i] = nil
 	}
@@ -113,39 +125,27 @@ func (b *iovecBuffer) pullViews(n int) buffer.VectorisedView {
 		// Exclude the size of the vnet header.
 		n -= virtioNetHdrSize
 	}
-	return buffer.NewVectorisedView(n, views)
-}
-
-// stopFd is an eventfd used to signal the stop of a dispatcher.
-type stopFd struct {
-	efd int
-}
-
-func newStopFd() (stopFd, error) {
-	efd, err := unix.Eventfd(0, unix.EFD_NONBLOCK)
-	if err != nil {
-		return stopFd{efd: -1}, fmt.Errorf("failed to create eventfd: %w", err)
+	pulled := buffer.Buffer{}
+	for _, v := range views {
+		pulled.Append(v)
 	}
-	return stopFd{efd: efd}, nil
+	pulled.Truncate(int64(n))
+	return pulled
 }
 
-// stop writes to the eventfd and notifies the dispatcher to stop. It does not
-// block.
-func (s *stopFd) stop() {
-	increment := []byte{1, 0, 0, 0, 0, 0, 0, 0}
-	if n, err := unix.Write(s.efd, increment); n != len(increment) || err != nil {
-		// There are two possible errors documented in eventfd(2) for writing:
-		// 1. We are writing 8 bytes and not 0xffffffffffffff, thus no EINVAL.
-		// 2. stop is only supposed to be called once, it can't reach the limit,
-		// thus no EAGAIN.
-		panic(fmt.Sprintf("write(efd) = (%d, %s), want (%d, nil)", n, err, len(increment)))
+func (b *iovecBuffer) release() {
+	for _, v := range b.views {
+		if v != nil {
+			v.Release()
+			v = nil
+		}
 	}
 }
 
 // readVDispatcher uses readv() system call to read inbound packets and
 // dispatches them.
 type readVDispatcher struct {
-	stopFd
+	stopfd.StopFD
 	// fd is the file descriptor used to send and receive packets.
 	fd int
 
@@ -157,39 +157,42 @@ type readVDispatcher struct {
 }
 
 func newReadVDispatcher(fd int, e *endpoint) (linkDispatcher, error) {
-	stopFd, err := newStopFd()
+	stopFD, err := stopfd.New()
 	if err != nil {
 		return nil, err
 	}
 	d := &readVDispatcher{
-		stopFd: stopFd,
+		StopFD: stopFD,
 		fd:     fd,
 		e:      e,
 	}
-	skipsVnetHdr := d.e.gsoKind == stack.HWGSOSupported
+	skipsVnetHdr := d.e.gsoKind == stack.HostGSOSupported
 	d.buf = newIovecBuffer(BufConfig, skipsVnetHdr)
 	return d, nil
 }
 
+func (d *readVDispatcher) release() {
+	d.buf.release()
+}
+
 // dispatch reads one packet from the file descriptor and dispatches it.
 func (d *readVDispatcher) dispatch() (bool, tcpip.Error) {
-	n, err := rawfile.BlockingReadvUntilStopped(d.efd, d.fd, d.buf.nextIovecs())
+	n, err := rawfile.BlockingReadvUntilStopped(d.EFD, d.fd, d.buf.nextIovecs())
 	if n <= 0 || err != nil {
 		return false, err
 	}
 
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Data: d.buf.pullViews(n),
+		Payload: d.buf.pullBuffer(n),
 	})
 	defer pkt.DecRef()
 
 	var p tcpip.NetworkProtocolNumber
 	if d.e.hdrSize > 0 {
-		hdr, ok := pkt.LinkHeader().Consume(d.e.hdrSize)
-		if !ok {
+		if !d.e.parseHeader(pkt) {
 			return false, nil
 		}
-		p = header.Ethernet(hdr).Type()
+		p = header.Ethernet(pkt.LinkHeader().Slice()).Type()
 	} else {
 		// We don't get any indication of what the packet is, so try to guess
 		// if it's an IPv4 or IPv6 packet.
@@ -208,7 +211,10 @@ func (d *readVDispatcher) dispatch() (bool, tcpip.Error) {
 		}
 	}
 
-	d.e.dispatcher.DeliverNetworkPacket(p, pkt)
+	d.e.mu.RLock()
+	dsp := d.e.dispatcher
+	d.e.mu.RUnlock()
+	dsp.DeliverNetworkPacket(p, pkt)
 
 	return true, nil
 }
@@ -216,7 +222,7 @@ func (d *readVDispatcher) dispatch() (bool, tcpip.Error) {
 // recvMMsgDispatcher uses the recvmmsg system call to read inbound packets and
 // dispatches them.
 type recvMMsgDispatcher struct {
-	stopFd
+	stopfd.StopFD
 	// fd is the file descriptor used to send and receive packets.
 	fd int
 
@@ -240,22 +246,28 @@ const (
 )
 
 func newRecvMMsgDispatcher(fd int, e *endpoint) (linkDispatcher, error) {
-	stopFd, err := newStopFd()
+	stopFD, err := stopfd.New()
 	if err != nil {
 		return nil, err
 	}
 	d := &recvMMsgDispatcher{
-		stopFd:  stopFd,
+		StopFD:  stopFD,
 		fd:      fd,
 		e:       e,
 		bufs:    make([]*iovecBuffer, MaxMsgsPerRecv),
 		msgHdrs: make([]rawfile.MMsgHdr, MaxMsgsPerRecv),
 	}
-	skipsVnetHdr := d.e.gsoKind == stack.HWGSOSupported
+	skipsVnetHdr := d.e.gsoKind == stack.HostGSOSupported
 	for i := range d.bufs {
 		d.bufs[i] = newIovecBuffer(BufConfig, skipsVnetHdr)
 	}
 	return d, nil
+}
+
+func (d *recvMMsgDispatcher) release() {
+	for _, iov := range d.bufs {
+		iov.release()
+	}
 }
 
 // recvMMsgDispatch reads more than one packet at a time from the file
@@ -273,7 +285,7 @@ func (d *recvMMsgDispatcher) dispatch() (bool, tcpip.Error) {
 		d.msgHdrs[k].Msg.SetIovlen(iovLen)
 	}
 
-	nMsgs, err := rawfile.BlockingRecvMMsgUntilStopped(d.efd, d.fd, d.msgHdrs)
+	nMsgs, err := rawfile.BlockingRecvMMsgUntilStopped(d.EFD, d.fd, d.msgHdrs)
 	if nMsgs == -1 || err != nil {
 		return false, err
 	}
@@ -281,11 +293,15 @@ func (d *recvMMsgDispatcher) dispatch() (bool, tcpip.Error) {
 	// Keep a list of packets so we can DecRef outside of the loop.
 	var pkts stack.PacketBufferList
 
+	d.e.mu.RLock()
+	dsp := d.e.dispatcher
+	d.e.mu.RUnlock()
+
 	defer func() { pkts.DecRef() }()
 	for k := 0; k < nMsgs; k++ {
 		n := int(d.msgHdrs[k].Len)
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-			Data: d.bufs[k].pullViews(n),
+			Payload: d.bufs[k].pullBuffer(n),
 		})
 		pkts.PushBack(pkt)
 
@@ -319,7 +335,7 @@ func (d *recvMMsgDispatcher) dispatch() (bool, tcpip.Error) {
 			}
 		}
 
-		d.e.dispatcher.DeliverNetworkPacket(p, pkt)
+		dsp.DeliverNetworkPacket(p, pkt)
 	}
 
 	return true, nil

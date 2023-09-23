@@ -19,10 +19,10 @@ package host
 import (
 	"fmt"
 	"math"
-	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/fdnotifier"
@@ -55,23 +55,23 @@ type virtualOwner struct {
 	// mu protects the fields below and they can be accessed using atomic memory
 	// operations.
 	mu  sync.Mutex `state:"nosave"`
-	uid uint32
-	gid uint32
+	uid atomicbitops.Uint32
+	gid atomicbitops.Uint32
 	// mode is also stored, otherwise setting the host file to `0000` could remove
 	// access to the file.
-	mode uint32
+	mode atomicbitops.Uint32
 }
 
 func (v *virtualOwner) atomicUID() uint32 {
-	return atomic.LoadUint32(&v.uid)
+	return v.uid.Load()
 }
 
 func (v *virtualOwner) atomicGID() uint32 {
-	return atomic.LoadUint32(&v.gid)
+	return v.gid.Load()
 }
 
 func (v *virtualOwner) atomicMode() uint32 {
-	return atomic.LoadUint32(&v.mode)
+	return v.mode.Load()
 }
 
 func isEpollable(fd int) bool {
@@ -94,11 +94,13 @@ func isEpollable(fd int) bool {
 //
 // +stateify savable
 type inode struct {
+	kernfs.CachedMappable
 	kernfs.InodeNoStatFS
+	kernfs.InodeAnonymous // inode is effectively anonymous because it represents a donated FD.
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
-	kernfs.CachedMappable
 	kernfs.InodeTemporary // This holds no meaning as this inode can't be Looked up and is always valid.
+	kernfs.InodeWatches
 
 	locks vfs.FileLocks
 
@@ -143,6 +145,12 @@ type inode struct {
 	// This field is initialized at creation time and is immutable.
 	savable bool
 
+	// readonly is true if operations that can potentially change the host file
+	// are blocked.
+	//
+	// This field is initialized at creation time and is immutable.
+	readonly bool
+
 	// Event queue for blocking operations.
 	queue waiter.Queue
 
@@ -153,14 +161,13 @@ type inode struct {
 
 	// If haveBuf is non-zero, hostFD represents a pipe, and buf contains data
 	// read from the pipe from previous calls to inode.beforeSave(). haveBuf
-	// and buf are protected by bufMu. haveBuf is accessed using atomic memory
-	// operations.
+	// and buf are protected by bufMu.
 	bufMu   sync.Mutex `state:"nosave"`
-	haveBuf uint32
+	haveBuf atomicbitops.Uint32
 	buf     []byte
 }
 
-func newInode(ctx context.Context, fs *filesystem, hostFD int, savable bool, fileType linux.FileMode, isTTY bool) (*inode, error) {
+func newInode(ctx context.Context, fs *filesystem, hostFD int, savable bool, fileType linux.FileMode, isTTY bool, readonly bool) (*inode, error) {
 	// Determine if hostFD is seekable.
 	_, err := unix.Seek(hostFD, 0, linux.SEEK_CUR)
 	seekable := !linuxerr.Equals(linuxerr.ESPIPE, err)
@@ -179,6 +186,7 @@ func newInode(ctx context.Context, fs *filesystem, hostFD int, savable bool, fil
 		seekable:  seekable,
 		isTTY:     isTTY,
 		savable:   savable,
+		readonly:  readonly,
 	}
 	i.InitRefs()
 	i.CachedMappable.Init(hostFD)
@@ -216,6 +224,10 @@ type NewFDOptions struct {
 	VirtualOwner bool
 	UID          auth.KUID
 	GID          auth.KGID
+
+	// If Readonly is true, we disallow operations that can potentially change
+	// the host file associated with the file descriptor.
+	Readonly bool
 }
 
 // NewFD returns a vfs.FileDescription representing the given host file
@@ -224,6 +236,23 @@ func NewFD(ctx context.Context, mnt *vfs.Mount, hostFD int, opts *NewFDOptions) 
 	fs, ok := mnt.Filesystem().Impl().(*filesystem)
 	if !ok {
 		return nil, fmt.Errorf("can't import host FDs into filesystems of type %T", mnt.Filesystem().Impl())
+	}
+
+	if opts.Readonly {
+		if opts.IsTTY {
+			// This is not a technical limitation, but access checks for TTYs
+			// have not been implemented yet.
+			return nil, fmt.Errorf("readonly file descriptor may currently not be a TTY")
+		}
+
+		flagsInt, err := unix.FcntlInt(uintptr(hostFD), unix.F_GETFL, 0)
+		if err != nil {
+			return nil, err
+		}
+		accessMode := uint32(flagsInt) & unix.O_ACCMODE
+		if accessMode != unix.O_RDONLY {
+			return nil, fmt.Errorf("readonly file descriptor may only be opened as O_RDONLY on the host")
+		}
 	}
 
 	// Retrieve metadata.
@@ -243,15 +272,15 @@ func NewFD(ctx context.Context, mnt *vfs.Mount, hostFD int, opts *NewFDOptions) 
 	}
 
 	fileType := linux.FileMode(stat.Mode).FileType()
-	i, err := newInode(ctx, fs, hostFD, opts.Savable, fileType, opts.IsTTY)
+	i, err := newInode(ctx, fs, hostFD, opts.Savable, fileType, opts.IsTTY, opts.Readonly)
 	if err != nil {
 		return nil, err
 	}
 	if opts.VirtualOwner {
 		i.virtualOwner.enabled = true
-		i.virtualOwner.uid = uint32(opts.UID)
-		i.virtualOwner.gid = uint32(opts.GID)
-		i.virtualOwner.mode = stat.Mode
+		i.virtualOwner.uid = atomicbitops.FromUint32(uint32(opts.UID))
+		i.virtualOwner.gid = atomicbitops.FromUint32(uint32(opts.GID))
+		i.virtualOwner.mode = atomicbitops.FromUint32(stat.Mode)
 	}
 
 	d := &kernfs.Dentry{}
@@ -344,6 +373,16 @@ func (i *inode) Mode() linux.FileMode {
 		panic(fmt.Sprintf("failed to retrieve mode from host fd %d: %v", i.hostFD, err))
 	}
 	return linux.FileMode(s.Mode)
+}
+
+// Mode implements kernfs.Inode.UID
+func (i *inode) UID() auth.KUID {
+	return auth.KUID(i.virtualOwner.uid.Load())
+}
+
+// Mode implements kernfs.Inode.GID
+func (i *inode) GID() auth.KGID {
+	return auth.KGID(i.virtualOwner.gid.Load())
 }
 
 // Stat implements kernfs.Inode.Stat.
@@ -491,6 +530,10 @@ func (i *inode) stat(stat *unix.Stat_t) error {
 //
 // +checklocksignore
 func (i *inode) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Credentials, opts vfs.SetStatOptions) error {
+	if i.readonly {
+		return linuxerr.EPERM
+	}
+
 	s := &opts.Stat
 
 	m := s.Mask
@@ -521,11 +564,11 @@ func (i *inode) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Cre
 
 	if m&linux.STATX_MODE != 0 {
 		if i.virtualOwner.enabled {
-			i.virtualOwner.mode = uint32(opts.Stat.Mode)
+			// We hold i.virtualOwner.mu.
+			i.virtualOwner.mode = atomicbitops.FromUint32(uint32(opts.Stat.Mode))
 		} else {
-			if err := unix.Fchmod(i.hostFD, uint32(s.Mode)); err != nil {
-				return err
-			}
+			log.Warningf("sentry seccomp filters don't allow making fchmod(2) syscall")
+			return unix.EPERM
 		}
 	}
 	if m&linux.STATX_SIZE != 0 {
@@ -555,10 +598,12 @@ func (i *inode) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Cre
 	}
 	if i.virtualOwner.enabled {
 		if m&linux.STATX_UID != 0 {
-			i.virtualOwner.uid = opts.Stat.UID
+			// We hold i.virtualOwner.mu.
+			i.virtualOwner.uid = atomicbitops.FromUint32(opts.Stat.UID)
 		}
 		if m&linux.STATX_GID != 0 {
-			i.virtualOwner.gid = opts.Stat.GID
+			// We hold i.virtualOwner.mu.
+			i.virtualOwner.gid = atomicbitops.FromUint32(opts.Stat.GID)
 		}
 	}
 	return nil
@@ -700,6 +745,9 @@ func (f *fileDescription) Release(context.Context) {
 
 // Allocate implements vfs.FileDescriptionImpl.Allocate.
 func (f *fileDescription) Allocate(ctx context.Context, mode, offset, length uint64) error {
+	if f.inode.readonly {
+		return linuxerr.EPERM
+	}
 	return unix.Fallocate(f.inode.hostFD, uint32(mode), int64(offset), int64(length))
 }
 
@@ -757,7 +805,7 @@ func (f *fileDescription) Read(ctx context.Context, dst usermem.IOSequence, opts
 }
 
 func (i *inode) readFromBuf(ctx context.Context, dst *usermem.IOSequence) (int64, error) {
-	if atomic.LoadUint32(&i.haveBuf) == 0 {
+	if i.haveBuf.Load() == 0 {
 		return 0, nil
 	}
 	i.bufMu.Lock()
@@ -769,7 +817,7 @@ func (i *inode) readFromBuf(ctx context.Context, dst *usermem.IOSequence) (int64
 	*dst = dst.DropFirst(n)
 	i.buf = i.buf[n:]
 	if len(i.buf) == 0 {
-		atomic.StoreUint32(&i.haveBuf, 0)
+		i.haveBuf.Store(0)
 		i.buf = nil
 	}
 	return int64(n), err
@@ -822,6 +870,9 @@ func (f *fileDescription) Write(ctx context.Context, src usermem.IOSequence, opt
 }
 
 func (f *fileDescription) writeToHostFD(ctx context.Context, src usermem.IOSequence, offset int64, flags uint32) (int64, error) {
+	if f.inode.readonly {
+		return 0, linuxerr.EPERM
+	}
 	hostFD := f.inode.hostFD
 	// TODO(gvisor.dev/issue/2601): Support select pwritev2 flags.
 	if flags != 0 {
@@ -906,6 +957,9 @@ func (f *fileDescription) Seek(_ context.Context, offset int64, whence int32) (i
 
 // Sync implements vfs.FileDescriptionImpl.Sync.
 func (f *fileDescription) Sync(ctx context.Context) error {
+	if f.inode.readonly {
+		return linuxerr.EPERM
+	}
 	// TODO(gvisor.dev/issue/1897): Currently, we always sync everything.
 	return unix.Fsync(f.inode.hostFD)
 }
@@ -955,7 +1009,7 @@ func (f *fileDescription) Epollable() bool {
 }
 
 // Ioctl queries the underlying FD for allowed ioctl commands.
-func (f *fileDescription) Ioctl(ctx context.Context, uio usermem.IO, args arch.SyscallArguments) (uintptr, error) {
+func (f *fileDescription) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
 	switch cmd := args[1].Int(); cmd {
 	case linux.FIONREAD:
 		v, err := ioctlFionread(f.inode.hostFD)
@@ -969,5 +1023,5 @@ func (f *fileDescription) Ioctl(ctx context.Context, uio usermem.IO, args arch.S
 		return 0, err
 	}
 
-	return f.FileDescriptionDefaultImpl.Ioctl(ctx, uio, args)
+	return f.FileDescriptionDefaultImpl.Ioctl(ctx, uio, sysno, args)
 }

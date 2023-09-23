@@ -126,7 +126,7 @@ func (r *receiver) getSendParams() (RcvNxt seqnum.Value, rcvWnd seqnum.Size) {
 	//
 	// Also, if the application is reading the data, we keep growing the right
 	// edge, as we are still advertising a window that we think can be serviced.
-	toGrow := unackLen >= SegSize || bufUsed <= r.prevBufUsed
+	toGrow := unackLen >= SegOverheadSize || bufUsed <= r.prevBufUsed
 
 	// Update RcvAcc only if new window is > previously advertised window. We
 	// should never shrink the acceptable sequence space once it has been
@@ -153,11 +153,11 @@ func (r *receiver) getSendParams() (RcvNxt seqnum.Value, rcvWnd seqnum.Size) {
 	// Keep advertising zero receive window up until the new window reaches a
 	// threshold.
 	if r.rcvWnd == 0 && newWnd != 0 {
-		r.ep.rcvQueueInfo.rcvQueueMu.Lock()
+		r.ep.rcvQueueMu.Lock()
 		if crossed, above := r.ep.windowCrossedACKThresholdLocked(int(newWnd), int(r.ep.ops.GetReceiveBufferSize())); !crossed && !above {
 			newWnd = 0
 		}
-		r.ep.rcvQueueInfo.rcvQueueMu.Unlock()
+		r.ep.rcvQueueMu.Unlock()
 	}
 
 	// Stash away the non-scaled receive window as we use it for measuring
@@ -216,7 +216,7 @@ func (r *receiver) consumeSegment(s *segment, segSeq seqnum.Value, segLen seqnum
 			segLen -= diff
 			segSeq.UpdateForward(diff)
 			s.sequenceNumber.UpdateForward(diff)
-			s.data.TrimFront(int(diff))
+			s.TrimFront(diff)
 		}
 
 		// Move segment to ready-to-deliver list. Wakeup any waiters.
@@ -293,6 +293,7 @@ func (r *receiver) consumeSegment(s *segment, segSeq seqnum.Value, segLen seqnum
 			r.pendingRcvdSegments[i] = nil
 		}
 		r.pendingRcvdSegments = r.pendingRcvdSegments[:first]
+		r.ep.updateConnDirectionState(connDirectionStateRcvClosed)
 
 		return true
 	}
@@ -328,36 +329,36 @@ func (r *receiver) updateRTT() {
 	// estimate the round-trip time by observing the time between when a byte
 	// is first acknowledged and the receipt of data that is at least one
 	// window beyond the sequence number that was acknowledged.
-	r.ep.rcvQueueInfo.rcvQueueMu.Lock()
-	if r.ep.rcvQueueInfo.RcvAutoParams.RTTMeasureTime == (tcpip.MonotonicTime{}) {
+	r.ep.rcvQueueMu.Lock()
+	if r.ep.RcvAutoParams.RTTMeasureTime == (tcpip.MonotonicTime{}) {
 		// New measurement.
-		r.ep.rcvQueueInfo.RcvAutoParams.RTTMeasureTime = r.ep.stack.Clock().NowMonotonic()
-		r.ep.rcvQueueInfo.RcvAutoParams.RTTMeasureSeqNumber = r.RcvNxt.Add(r.rcvWnd)
-		r.ep.rcvQueueInfo.rcvQueueMu.Unlock()
+		r.ep.RcvAutoParams.RTTMeasureTime = r.ep.stack.Clock().NowMonotonic()
+		r.ep.RcvAutoParams.RTTMeasureSeqNumber = r.RcvNxt.Add(r.rcvWnd)
+		r.ep.rcvQueueMu.Unlock()
 		return
 	}
-	if r.RcvNxt.LessThan(r.ep.rcvQueueInfo.RcvAutoParams.RTTMeasureSeqNumber) {
-		r.ep.rcvQueueInfo.rcvQueueMu.Unlock()
+	if r.RcvNxt.LessThan(r.ep.RcvAutoParams.RTTMeasureSeqNumber) {
+		r.ep.rcvQueueMu.Unlock()
 		return
 	}
-	rtt := r.ep.stack.Clock().NowMonotonic().Sub(r.ep.rcvQueueInfo.RcvAutoParams.RTTMeasureTime)
+	rtt := r.ep.stack.Clock().NowMonotonic().Sub(r.ep.RcvAutoParams.RTTMeasureTime)
 	// We only store the minimum observed RTT here as this is only used in
 	// absence of a SRTT available from either timestamps or a sender
 	// measurement of RTT.
-	if r.ep.rcvQueueInfo.RcvAutoParams.RTT == 0 || rtt < r.ep.rcvQueueInfo.RcvAutoParams.RTT {
-		r.ep.rcvQueueInfo.RcvAutoParams.RTT = rtt
+	if r.ep.RcvAutoParams.RTT == 0 || rtt < r.ep.RcvAutoParams.RTT {
+		r.ep.RcvAutoParams.RTT = rtt
 	}
-	r.ep.rcvQueueInfo.RcvAutoParams.RTTMeasureTime = r.ep.stack.Clock().NowMonotonic()
-	r.ep.rcvQueueInfo.RcvAutoParams.RTTMeasureSeqNumber = r.RcvNxt.Add(r.rcvWnd)
-	r.ep.rcvQueueInfo.rcvQueueMu.Unlock()
+	r.ep.RcvAutoParams.RTTMeasureTime = r.ep.stack.Clock().NowMonotonic()
+	r.ep.RcvAutoParams.RTTMeasureSeqNumber = r.RcvNxt.Add(r.rcvWnd)
+	r.ep.rcvQueueMu.Unlock()
 }
 
 // +checklocks:r.ep.mu
 // +checklocksalias:r.ep.snd.ep.mu=r.ep.mu
 func (r *receiver) handleRcvdSegmentClosing(s *segment, state EndpointState, closed bool) (drop bool, err tcpip.Error) {
-	r.ep.rcvQueueInfo.rcvQueueMu.Lock()
-	rcvClosed := r.ep.rcvQueueInfo.RcvClosed || r.closed
-	r.ep.rcvQueueInfo.rcvQueueMu.Unlock()
+	r.ep.rcvQueueMu.Lock()
+	rcvClosed := r.ep.RcvClosed || r.closed
+	r.ep.rcvQueueMu.Unlock()
 
 	// If we are in one of the shutdown states then we need to do
 	// additional checks before we try and process the segment.
@@ -400,7 +401,7 @@ func (r *receiver) handleRcvdSegmentClosing(s *segment, state EndpointState, clo
 		// incoming FIN or the user calling shutdown(..,
 		// SHUT_RD) then any data past the RcvNxt should
 		// trigger a RST.
-		endDataSeq := s.sequenceNumber.Add(seqnum.Size(s.data.Size()))
+		endDataSeq := s.sequenceNumber.Add(seqnum.Size(s.payloadSize()))
 		if state != StateCloseWait && rcvClosed && r.RcvNxt.LessThan(endDataSeq) {
 			return true, &tcpip.ErrConnectionAborted{}
 		}
@@ -441,7 +442,7 @@ func (r *receiver) handleRcvdSegmentClosing(s *segment, state EndpointState, clo
 	// NOTE: We still want to permit a FIN as it's possible only our
 	// end has closed and the peer is yet to send a FIN. Hence we
 	// compare only the payload.
-	segEnd := s.sequenceNumber.Add(seqnum.Size(s.data.Size()))
+	segEnd := s.sequenceNumber.Add(seqnum.Size(s.payloadSize()))
 	if rcvClosed && !segEnd.LessThanEq(r.RcvNxt) {
 		return true, nil
 	}
@@ -456,7 +457,7 @@ func (r *receiver) handleRcvdSegment(s *segment) (drop bool, err tcpip.Error) {
 	state := r.ep.EndpointState()
 	closed := r.ep.closed
 
-	segLen := seqnum.Size(s.data.Size())
+	segLen := seqnum.Size(s.payloadSize())
 	segSeq := s.sequenceNumber
 
 	// If the sequence number range is outside the acceptable range, just
@@ -480,16 +481,29 @@ func (r *receiver) handleRcvdSegment(s *segment) (drop bool, err tcpip.Error) {
 	// Defer segment processing if it can't be consumed now.
 	if !r.consumeSegment(s, segSeq, segLen) {
 		if segLen > 0 || s.flags.Contains(header.TCPFlagFin) {
-			// We only store the segment if it's within our buffer size limit.
+			// We only store the segment if it's within our buffer
+			// size limit.
 			//
-			// Only use 75% of the receive buffer queue for out-of-order
-			// segments. This ensures that we always leave some space for the inorder
-			// segments to arrive allowing pending segments to be processed and
+			// Only use 75% of the receive buffer queue for
+			// out-of-order segments. This ensures that we always
+			// leave some space for the inorder segments to arrive
+			// allowing pending segments to be processed and
 			// delivered to the user.
-			if rcvBufSize := r.ep.ops.GetReceiveBufferSize(); rcvBufSize > 0 && (r.PendingBufUsed+int(segLen)) < int(rcvBufSize)>>2 {
-				r.ep.rcvQueueInfo.rcvQueueMu.Lock()
+			//
+			// The ratio must be at least 50% (the size of rwnd) to
+			// leave space for retransmitted dropped packets. 51%
+			// would make recovery slow when there are multiple
+			// drops by necessitating multiple round trips. 100%
+			// would enable the buffer to be totally full of
+			// out-of-order data and stall the connection.
+			//
+			// An ideal solution is to ensure that there are at
+			// least N bytes free when N bytes are missing, but we
+			// don't have that computed at this point in the stack.
+			if rcvBufSize := r.ep.ops.GetReceiveBufferSize(); rcvBufSize > 0 && (r.PendingBufUsed+int(segLen)) < int(rcvBufSize-rcvBufSize/4) {
+				r.ep.rcvQueueMu.Lock()
 				r.PendingBufUsed += s.segMemSize()
-				r.ep.rcvQueueInfo.rcvQueueMu.Unlock()
+				r.ep.rcvQueueMu.Unlock()
 				s.IncRef()
 				heap.Push(&r.pendingRcvdSegments, s)
 				UpdateSACKBlocks(&r.ep.sack, segSeq, segSeq.Add(segLen), r.RcvNxt)
@@ -513,7 +527,7 @@ func (r *receiver) handleRcvdSegment(s *segment) (drop bool, err tcpip.Error) {
 	// now. So try to do it.
 	for !r.closed && r.pendingRcvdSegments.Len() > 0 {
 		s := r.pendingRcvdSegments[0]
-		segLen := seqnum.Size(s.data.Size())
+		segLen := seqnum.Size(s.payloadSize())
 		segSeq := s.sequenceNumber
 
 		// Skip segment altogether if it has already been acknowledged.
@@ -523,9 +537,9 @@ func (r *receiver) handleRcvdSegment(s *segment) (drop bool, err tcpip.Error) {
 		}
 
 		heap.Pop(&r.pendingRcvdSegments)
-		r.ep.rcvQueueInfo.rcvQueueMu.Lock()
+		r.ep.rcvQueueMu.Lock()
 		r.PendingBufUsed -= s.segMemSize()
-		r.ep.rcvQueueInfo.rcvQueueMu.Unlock()
+		r.ep.rcvQueueMu.Unlock()
 		s.DecRef()
 	}
 	return false, nil
@@ -537,7 +551,7 @@ func (r *receiver) handleRcvdSegment(s *segment) (drop bool, err tcpip.Error) {
 // +checklocksalias:r.ep.snd.ep.mu=r.ep.mu
 func (r *receiver) handleTimeWaitSegment(s *segment) (resetTimeWait bool, newSyn bool) {
 	segSeq := s.sequenceNumber
-	segLen := seqnum.Size(s.data.Size())
+	segLen := seqnum.Size(s.payloadSize())
 
 	// Just silently drop any RST packets in TIME_WAIT. We do not support
 	// TIME_WAIT assasination as a result we confirm w/ fix 1 as described
