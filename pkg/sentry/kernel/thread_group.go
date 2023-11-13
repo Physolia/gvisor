@@ -322,6 +322,13 @@ func (tg *ThreadGroup) Release(ctx context.Context) {
 		its = append(its, it)
 	}
 	tg.timers = make(map[linux.TimerID]*IntervalTimer) // nil maps can't be saved
+	// Disassociate from the tty if we have one.
+	if tg.tty != nil {
+		tg.tty.mu.Lock()
+		tg.tty.tg = nil
+		tg.tty.mu.Unlock()
+		tg.tty = nil
+	}
 	tg.signalHandlers.mu.Unlock()
 	tg.pidns.owner.mu.Unlock()
 	for _, it := range its {
@@ -376,7 +383,12 @@ func (tg *ThreadGroup) SetControllingTTY(tty *TTY, steal bool, isReadable bool) 
 
 	// "The calling process must be a session leader and not have a
 	// controlling terminal already." - tty_ioctl(4)
-	if tg.processGroup.session.leader != tg || tg.tty != nil {
+	if tg.processGroup.session.leader != tg {
+		return linuxerr.EINVAL
+	}
+	if tg.tty == tty {
+		return nil
+	} else if tg.tty != nil {
 		return linuxerr.EINVAL
 	}
 

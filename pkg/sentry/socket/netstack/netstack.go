@@ -1076,13 +1076,8 @@ func getSockOptSocket(t *kernel.Task, s socket.Socket, ep commonEndpoint, family
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		// This option is only viable for TCP endpoints.
-		var v bool
-		if socket.IsTCP(s) {
-			v = tcp.EndpointState(ep.State()) == tcp.StateListen
-		}
-		vP := primitive.Int32(boolToInt32(v))
-		return &vP, nil
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetAcceptConn()))
+		return &v, nil
 
 	case linux.SO_RCVLOWAT:
 		if outLen < sizeOfInt32 {
@@ -2316,7 +2311,7 @@ func setSockOptIPv6(t *kernel.Task, s socket.Socket, ep commonEndpoint, name int
 			return syserr.ErrNoDevice
 		}
 		// Stack must be a netstack stack.
-		return netfilter.SetEntries(t, stk.(*Stack).Stack, optVal, true)
+		return netfilter.SetEntries(t.Credentials().UserNamespace, stk.(*Stack).Stack, optVal, true)
 
 	case linux.IP6T_SO_SET_ADD_COUNTERS:
 		log.Infof("IP6T_SO_SET_ADD_COUNTERS is not supported")
@@ -2563,7 +2558,7 @@ func setSockOptIP(t *kernel.Task, s socket.Socket, ep commonEndpoint, name int, 
 			return syserr.ErrNoDevice
 		}
 		// Stack must be a netstack stack.
-		return netfilter.SetEntries(t, stk.(*Stack).Stack, optVal, false)
+		return netfilter.SetEntries(t.Credentials().UserNamespace, stk.(*Stack).Stack, optVal, false)
 
 	case linux.IPT_SO_SET_ADD_COUNTERS:
 		log.Infof("IPT_SO_SET_ADD_COUNTERS is not supported")

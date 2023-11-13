@@ -42,6 +42,7 @@ import (
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/cpuid"
+	"gvisor.dev/gvisor/pkg/devutil"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/eventchannel"
 	"gvisor.dev/gvisor/pkg/fspath"
@@ -81,17 +82,17 @@ import (
 // allow easy access everywhere.
 var IOUringEnabled = false
 
-// userCounters is a set of user counters.
+// UserCounters is a set of user counters.
 //
 // +stateify savable
-type userCounters struct {
+type UserCounters struct {
 	uid auth.KUID
 
 	rlimitNProc atomicbitops.Uint64
 }
 
 // incRLimitNProc increments the rlimitNProc counter.
-func (uc *userCounters) incRLimitNProc(ctx context.Context) error {
+func (uc *UserCounters) incRLimitNProc(ctx context.Context) error {
 	lim := limits.FromContext(ctx).Get(limits.ProcessCount)
 	creds := auth.CredentialsFromContext(ctx)
 	nproc := uc.rlimitNProc.Add(1)
@@ -105,7 +106,7 @@ func (uc *userCounters) incRLimitNProc(ctx context.Context) error {
 }
 
 // decRLimitNProc decrements the rlimitNProc counter.
-func (uc *userCounters) decRLimitNProc() {
+func (uc *UserCounters) decRLimitNProc() {
 	uc.rlimitNProc.Add(^uint64(0))
 }
 
@@ -139,18 +140,17 @@ type Kernel struct {
 	mf *pgalloc.MemoryFile `state:"nosave"`
 
 	// See InitKernelArgs for the meaning of these fields.
-	featureSet                  cpuid.FeatureSet
-	timekeeper                  *Timekeeper
-	tasks                       *TaskSet
-	rootUserNamespace           *auth.UserNamespace
-	rootNetworkNamespace        *inet.Namespace
-	applicationCores            uint
-	useHostCores                bool
-	extraAuxv                   []arch.AuxEntry
-	vdso                        *loader.VDSO
-	rootUTSNamespace            *UTSNamespace
-	rootIPCNamespace            *IPCNamespace
-	rootAbstractSocketNamespace *AbstractSocketNamespace
+	featureSet           cpuid.FeatureSet
+	timekeeper           *Timekeeper
+	tasks                *TaskSet
+	rootUserNamespace    *auth.UserNamespace
+	rootNetworkNamespace *inet.Namespace
+	applicationCores     uint
+	useHostCores         bool
+	extraAuxv            []arch.AuxEntry
+	vdso                 *loader.VDSO
+	rootUTSNamespace     *UTSNamespace
+	rootIPCNamespace     *IPCNamespace
 
 	// futexes is the "root" futex.Manager, from which all others are forked.
 	// This is necessary to ensure that shared futexes are coherent across all
@@ -322,8 +322,16 @@ type Kernel struct {
 	cgroupRegistry *CgroupRegistry
 
 	// userCountersMap maps auth.KUID into a set of user counters.
-	userCountersMap   map[auth.KUID]*userCounters
+	userCountersMap   map[auth.KUID]*UserCounters
 	userCountersMapMu userCountersMutex `state:"nosave"`
+
+	// MaxFDLimit specifies the maximum file descriptor number that can be
+	// used by processes.
+	MaxFDLimit atomicbitops.Int32
+
+	// devGofers maps container ID to its device gofer client.
+	devGofers   map[string]*devutil.GoferClient `state:"nosave"`
+	devGofersMu sync.Mutex                      `state:"nosave"`
 }
 
 // InitKernelArgs holds arguments to Init.
@@ -366,11 +374,13 @@ type InitKernelArgs struct {
 	// RootIPCNamespace is the root IPC namespace.
 	RootIPCNamespace *IPCNamespace
 
-	// RootAbstractSocketNamespace is the root Abstract Socket namespace.
-	RootAbstractSocketNamespace *AbstractSocketNamespace
-
 	// PIDNamespace is the root PID namespace.
 	PIDNamespace *PIDNamespace
+
+	// MaxFDLimit specifies the maximum file descriptor number that can be
+	// used by processes.  If it is zero, the limit will be set to
+	// unlimited.
+	MaxFDLimit int32
 }
 
 // Init initialize the Kernel with no tasks.
@@ -397,7 +407,6 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 	k.rootUserNamespace = args.RootUserNamespace
 	k.rootUTSNamespace = args.RootUTSNamespace
 	k.rootIPCNamespace = args.RootIPCNamespace
-	k.rootAbstractSocketNamespace = args.RootAbstractSocketNamespace
 	k.rootNetworkNamespace = args.RootNetworkNamespace
 	if k.rootNetworkNamespace == nil {
 		k.rootNetworkNamespace = inet.NewRootNamespace(nil, nil, args.RootUserNamespace)
@@ -424,7 +433,11 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 	k.netlinkPorts = port.New()
 	k.ptraceExceptions = make(map[*Task]*Task)
 	k.YAMAPtraceScope = atomicbitops.FromInt32(linux.YAMA_SCOPE_RELATIONAL)
-	k.userCountersMap = make(map[auth.KUID]*userCounters)
+	k.userCountersMap = make(map[auth.KUID]*UserCounters)
+	if args.MaxFDLimit == 0 {
+		args.MaxFDLimit = MaxFdLimit
+	}
+	k.MaxFDLimit.Store(args.MaxFDLimit)
 
 	ctx := k.SupervisorContext()
 	if err := k.vfs.Init(ctx); err != nil {
@@ -461,6 +474,7 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 			// value for sbinfo->max_blocks when SB_KERNMOUNT is set.
 			DisableDefaultSizeLimit: true,
 		},
+		InternalMount: true,
 	}
 	tmpfsFilesystem, tmpfsRoot, err := tmpfs.FilesystemType{}.GetFilesystem(ctx, &k.vfs, auth.NewRootCredentials(k.rootUserNamespace), "", tmpfsOpts)
 	if err != nil {
@@ -727,9 +741,6 @@ type CreateProcessArgs struct {
 	// PIDNamespace is the initial PID Namespace.
 	PIDNamespace *PIDNamespace
 
-	// AbstractSocketNamespace is the initial Abstract Socket namespace.
-	AbstractSocketNamespace *AbstractSocketNamespace
-
 	// MountNamespace optionally contains the mount namespace for this
 	// process. If nil, the init process's mount namespace is used.
 	//
@@ -792,6 +803,8 @@ func (ctx *createProcessContext) Value(key any) any {
 		mntns := ctx.kernel.GlobalInit().Leader().MountNamespace()
 		mntns.IncRef()
 		return mntns
+	case devutil.CtxDevGoferClient:
+		return ctx.kernel.getDevGoferClient(ctx.args.ContainerID)
 	case inet.CtxStack:
 		return ctx.kernel.RootNetworkNamespace().Stack()
 	case ktime.CtxRealtimeClock:
@@ -937,21 +950,20 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 
 	// Create the task.
 	config := &TaskConfig{
-		Kernel:                  k,
-		ThreadGroup:             tg,
-		TaskImage:               image,
-		FSContext:               fsContext,
-		FDTable:                 args.FDTable,
-		Credentials:             args.Credentials,
-		NetworkNamespace:        k.RootNetworkNamespace(),
-		AllowedCPUMask:          sched.NewFullCPUSet(k.applicationCores),
-		UTSNamespace:            args.UTSNamespace,
-		IPCNamespace:            args.IPCNamespace,
-		AbstractSocketNamespace: args.AbstractSocketNamespace,
-		MountNamespace:          mntns,
-		ContainerID:             args.ContainerID,
-		InitialCgroups:          args.InitialCgroups,
-		UserCounters:            k.GetUserCounters(args.Credentials.RealKUID),
+		Kernel:           k,
+		ThreadGroup:      tg,
+		TaskImage:        image,
+		FSContext:        fsContext,
+		FDTable:          args.FDTable,
+		Credentials:      args.Credentials,
+		NetworkNamespace: k.RootNetworkNamespace(),
+		AllowedCPUMask:   sched.NewFullCPUSet(k.applicationCores),
+		UTSNamespace:     args.UTSNamespace,
+		IPCNamespace:     args.IPCNamespace,
+		MountNamespace:   mntns,
+		ContainerID:      args.ContainerID,
+		InitialCgroups:   args.InitialCgroups,
+		UserCounters:     k.GetUserCounters(args.Credentials.RealKUID),
 		// A task with no parent starts out with no session keyring.
 		SessionKeyring: nil,
 	}
@@ -1023,7 +1035,7 @@ func (k *Kernel) Start() error {
 func (k *Kernel) pauseTimeLocked(ctx context.Context) {
 	// Since all task goroutines have been stopped by precondition, the CPU clock
 	// ticker should stop on its own; wait for it to do so, waking it up from
-	// sleeping betwen ticks if necessary.
+	// sleeping between ticks if necessary.
 	k.runningTasksMu.Lock()
 	for k.cpuClockTickerRunning {
 		select {
@@ -1322,11 +1334,6 @@ func (k *Kernel) RootIPCNamespace() *IPCNamespace {
 // RootPIDNamespace returns the root PIDNamespace.
 func (k *Kernel) RootPIDNamespace() *PIDNamespace {
 	return k.tasks.Root
-}
-
-// RootAbstractSocketNamespace returns the root AbstractSocketNamespace.
-func (k *Kernel) RootAbstractSocketNamespace() *AbstractSocketNamespace {
-	return k.rootAbstractSocketNamespace
 }
 
 // RootNetworkNamespace returns the root network namespace, always non-nil.
@@ -1683,6 +1690,7 @@ func (k *Kernel) Release() {
 	k.timekeeper.Destroy()
 	k.vdso.Release(ctx)
 	k.RootNetworkNamespace().DecRef(ctx)
+	k.cleaupDevGofers()
 }
 
 // PopulateNewCgroupHierarchy moves all tasks into a newly created cgroup
@@ -1742,6 +1750,8 @@ func (k *Kernel) ReleaseCgroupHierarchy(hid uint32) {
 	}
 }
 
+// ReplaceFSContextRoots updates root and cwd to `newRoot` in the FSContext
+// across all tasks whose old root or cwd were `oldRoot`.
 func (k *Kernel) ReplaceFSContextRoots(ctx context.Context, oldRoot vfs.VirtualDentry, newRoot vfs.VirtualDentry) {
 	k.tasks.mu.RLock()
 	oldRootDecRefs := 0
@@ -1769,7 +1779,8 @@ func (k *Kernel) ReplaceFSContextRoots(ctx context.Context, oldRoot vfs.VirtualD
 	}
 }
 
-func (k *Kernel) GetUserCounters(uid auth.KUID) *userCounters {
+// GetUserCounters returns the user counters for the given KUID.
+func (k *Kernel) GetUserCounters(uid auth.KUID) *UserCounters {
 	k.userCountersMapMu.Lock()
 	defer k.userCountersMapMu.Unlock()
 
@@ -1777,7 +1788,52 @@ func (k *Kernel) GetUserCounters(uid auth.KUID) *userCounters {
 		return uc
 	}
 
-	uc := &userCounters{}
+	uc := &UserCounters{}
 	k.userCountersMap[uid] = uc
 	return uc
+}
+
+// AddDevGofer initializes the dev gofer connection and starts tracking it.
+// It takes ownership of goferFD.
+func (k *Kernel) AddDevGofer(cid string, goferFD int) error {
+	client, err := devutil.NewGoferClient(k.SupervisorContext(), goferFD)
+	if err != nil {
+		return err
+	}
+
+	k.devGofersMu.Lock()
+	defer k.devGofersMu.Unlock()
+	if k.devGofers == nil {
+		k.devGofers = make(map[string]*devutil.GoferClient)
+	}
+	k.devGofers[cid] = client
+	return nil
+}
+
+// RemoveDevGofer closes the dev gofer connection, if one exists, and stops
+// tracking it.
+func (k *Kernel) RemoveDevGofer(cid string) {
+	k.devGofersMu.Lock()
+	defer k.devGofersMu.Unlock()
+	client, ok := k.devGofers[cid]
+	if !ok {
+		return
+	}
+	client.Close()
+	delete(k.devGofers, cid)
+}
+
+func (k *Kernel) getDevGoferClient(cid string) *devutil.GoferClient {
+	k.devGofersMu.Lock()
+	defer k.devGofersMu.Unlock()
+	return k.devGofers[cid]
+}
+
+func (k *Kernel) cleaupDevGofers() {
+	k.devGofersMu.Lock()
+	defer k.devGofersMu.Unlock()
+	for _, client := range k.devGofers {
+		client.Close()
+	}
+	k.devGofers = nil
 }

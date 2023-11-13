@@ -18,8 +18,8 @@ package seccomp
 
 import (
 	"fmt"
-	"reflect"
 	"sort"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/bpf"
@@ -31,15 +31,12 @@ const (
 	skipOneInst = 1
 
 	// defaultLabel is the label for the default action.
-	defaultLabel = "default_action"
-)
+	defaultLabel = label("default_action")
 
-// NonNegativeFDCheck ensures an FD argument is a non-negative int.
-func NonNegativeFDCheck() LessThanOrEqual {
-	// Negative int32 has the MSB (31st bit) set. So the raw uint FD value must
-	// be less than or equal to 0x7fffffff.
-	return LessThanOrEqual(0x7fffffff)
-}
+	// vsyscallPageIPMask is the bit we expect to see in the instruction
+	// pointer of a vsyscall call.
+	vsyscallPageIPMask = 1 << 31
+)
 
 // Install generates BPF code based on the set of syscalls provided. It only
 // allows syscalls that conform to the specification. Syscalls that violate the
@@ -55,29 +52,24 @@ func NonNegativeFDCheck() LessThanOrEqual {
 // making it possible for the process to continue running after a violation.
 // However, it will leave a SECCOMP audit event trail behind. In any case, the
 // syscall is still blocked from executing.
-func Install(rules SyscallRules, denyRules SyscallRules) error {
-	defaultAction, err := defaultAction()
-	if err != nil {
-		return err
-	}
-
+func Install(rules SyscallRules, denyRules SyscallRules, options ProgramOptions) error {
 	// ***   DEBUG TIP   ***
 	// If you suspect the process is getting killed due to a seccomp violation, uncomment the line
 	// below to get a panic stack trace when there is a violation.
-	// defaultAction = linux.BPFAction(linux.SECCOMP_RET_TRAP)
+	// options.DefaultAction = Return(linux.BPFAction(linux.SECCOMP_RET_TRAP))
 
-	log.Infof("Installing seccomp filters for %d syscalls (action=%v)", len(rules), defaultAction)
+	log.Infof("Installing seccomp filters for %d syscalls (action=%v)", rules.Size(), options.DefaultAction)
 
-	instrs, err := BuildProgram([]RuleSet{
+	instrs, _, err := BuildProgram([]RuleSet{
 		{
 			Rules:  denyRules,
-			Action: defaultAction,
+			Action: options.DefaultAction,
 		},
 		{
 			Rules:  rules,
 			Action: linux.SECCOMP_RET_ALLOW,
 		},
-	}, defaultAction, defaultAction)
+	}, options)
 	if log.IsLogging(log.Debug) {
 		programStr, errDecode := bpf.DecodeInstructions(instrs)
 		if errDecode != nil {
@@ -128,35 +120,286 @@ var SyscallName = func(sysno uintptr) string {
 	return fmt.Sprintf("syscall_%d", sysno)
 }
 
+// syscallProgram builds a BPF program for applying syscall rules.
+// It is a stateful struct that is updated as the program is built.
+type syscallProgram struct {
+	// program is the underlying BPF program being built.
+	program *bpf.ProgramBuilder
+}
+
+// Stmt adds a statement to the program.
+func (s *syscallProgram) Stmt(code uint16, k uint32) {
+	s.program.AddStmt(code, k)
+}
+
+// label is a custom label type which is returned by `labelSet`.
+type label string
+
+// JumpTo adds a jump instruction to the program, jumping to the given label.
+func (s *syscallProgram) JumpTo(label label) {
+	s.program.AddDirectJumpLabel(string(label))
+}
+
+// If checks a condition and jumps to a label if the condition is true.
+// If the condition is false, the program continues executing (no jumping).
+func (s *syscallProgram) If(code uint16, k uint32, jt label) {
+	s.program.AddJump(code, k, 0, skipOneInst)
+	s.JumpTo(jt)
+}
+
+// IfNot checks a condition and jumps to a label if the condition is false.
+// If the condition is true, the program continues executing (no jumping).
+func (s *syscallProgram) IfNot(code uint16, k uint32, jf label) {
+	s.program.AddJump(code, k, skipOneInst, 0)
+	s.JumpTo(jf)
+}
+
+// Ret adds a return instruction to the program.
+func (s *syscallProgram) Ret(action linux.BPFAction) {
+	s.Stmt(bpf.Ret|bpf.K, uint32(action))
+}
+
+// Label adds a label to the program.
+// It panics if this label has already been added to the program.
+func (s *syscallProgram) Label(label label) {
+	if err := s.program.AddLabel(string(label)); err != nil {
+		panic(fmt.Sprintf("cannot add label %q to program: %v", label, err))
+	}
+}
+
+// Record starts recording the instructions added to the program from now on.
+// It returns a syscallFragment which can be used to perform assertions on the
+// possible set of outcomes of the set of instruction that has been added
+// since `Record` was called.
+func (s *syscallProgram) Record() syscallProgramFragment {
+	return syscallProgramFragment{s.program.Record()}
+}
+
+// syscallProgramFragment represents a fragment of the syscall program.
+type syscallProgramFragment struct {
+	getFragment func() bpf.ProgramFragment
+}
+
+// MustHaveJumpedTo asserts that the fragment must jump to one of the
+// given labels.
+// The fragment may not jump to any other label, nor return, nor fall through.
+func (f syscallProgramFragment) MustHaveJumpedTo(labels ...label) {
+	f.MustHaveJumpedToOrReturned(labels, nil)
+}
+
+// MustHaveJumpedToOrReturned asserts that the fragment must jump to one of
+// the given labels, or have returned one of the given return values.
+// The fragment may not jump to any other label, nor fall through,
+// nor return a non-deterministic value.
+func (f syscallProgramFragment) MustHaveJumpedToOrReturned(possibleLabels []label, possibleReturnValues map[linux.BPFAction]struct{}) {
+	fragment := f.getFragment()
+	outcomes := fragment.Outcomes()
+	if outcomes.MayFallThrough {
+		panic(fmt.Sprintf("fragment %v may fall through", fragment))
+	}
+	if len(possibleReturnValues) == 0 && outcomes.MayReturn() {
+		panic(fmt.Sprintf("fragment %v may return", fragment))
+	}
+	if outcomes.MayReturnRegisterA {
+		panic(fmt.Sprintf("fragment %v may return register A", fragment))
+	}
+	if outcomes.MayJumpToKnownOffsetBeyondFragment {
+		panic(fmt.Sprintf("fragment %v may jump to an offset beyond the fragment", fragment))
+	}
+	for jumpLabel := range outcomes.MayJumpToUnresolvedLabels {
+		found := false
+		for _, wantLabel := range possibleLabels {
+			if jumpLabel == string(wantLabel) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			panic(fmt.Sprintf("fragment %v may jump to a label %q which is not one of %v", fragment, jumpLabel, possibleLabels))
+		}
+	}
+	for returnValue := range outcomes.MayReturnImmediate {
+		if _, found := possibleReturnValues[returnValue]; !found {
+			panic(fmt.Sprintf("fragment %v may return a value %q which is not one of %v", fragment, returnValue, possibleReturnValues))
+		}
+	}
+}
+
+// labelSet keeps track of labels that individual rules may jump to if they
+// either match or mismatch.
+// It can generate unique label names, and can be used recursively within
+// rules.
+type labelSet struct {
+	// prefix is a label prefix used when generating label names.
+	prefix string
+
+	// labelCounter is used to generate unique label names.
+	labelCounter int
+
+	// ruleMatched is the label that a rule should jump to if it matches.
+	ruleMatched label
+
+	// ruleMismatched is the label that a rule should jump to if it doesn't
+	// match.
+	ruleMismatched label
+}
+
+// NewLabel returns a new unique label.
+func (l *labelSet) NewLabel() label {
+	newLabel := label(fmt.Sprintf("%s#%d", l.prefix, l.labelCounter))
+	l.labelCounter++
+	return newLabel
+}
+
+// Matched returns the label to jump to if the rule matches.
+func (l *labelSet) Matched() label {
+	return l.ruleMatched
+}
+
+// Mismatched returns the label to jump to if the rule does not match.
+func (l *labelSet) Mismatched() label {
+	return l.ruleMismatched
+}
+
+// Push creates a new labelSet meant to be used in a recursive context of the
+// rule currently being rendered.
+// Labels generated by this new labelSet will have `labelSuffix` appended to
+// this labelSet's current prefix, and will have its matched/mismatched labels
+// point to the given labels.
+func (l *labelSet) Push(labelSuffix string, newRuleMatch, newRuleMismatch label) *labelSet {
+	newPrefix := labelSuffix
+	if l.prefix != "" {
+		newPrefix = fmt.Sprintf("%s_%s", l.prefix, labelSuffix)
+	}
+	return &labelSet{
+		prefix:         newPrefix,
+		ruleMatched:    newRuleMatch,
+		ruleMismatched: newRuleMismatch,
+	}
+}
+
+// matchedValue keeps track of BPF instructions needed to load a 64-bit value
+// being matched against. Since BPF can only do operations on 32-bit
+// instructions, value-matching code needs to selectively load one or the
+// other half of the 64-bit value.
+type matchedValue struct {
+	program        *syscallProgram
+	dataOffsetHigh uint32
+	dataOffsetLow  uint32
+}
+
+// LoadHigh32Bits loads the high 32-bit of the 64-bit value into register A.
+func (m matchedValue) LoadHigh32Bits() {
+	m.program.Stmt(bpf.Ld|bpf.Abs|bpf.W, m.dataOffsetHigh)
+}
+
+// LoadLow32Bits loads the low 32-bit of the 64-bit value into register A.
+func (m matchedValue) LoadLow32Bits() {
+	m.program.Stmt(bpf.Ld|bpf.Abs|bpf.W, m.dataOffsetLow)
+}
+
+// ProgramOptions configure a seccomp program.
+type ProgramOptions struct {
+	// DefaultAction is the action returned when none of the rules match.
+	DefaultAction linux.BPFAction
+
+	// BadArchAction is the action returned when the architecture of the
+	// syscall structure input doesn't match the one the program expects.
+	BadArchAction linux.BPFAction
+}
+
+// DefaultProgramOptions returns the default program options.
+func DefaultProgramOptions() ProgramOptions {
+	action, err := defaultAction()
+	if err != nil {
+		panic(fmt.Sprintf("cannot determine default seccomp action: %v", err))
+	}
+	return ProgramOptions{
+		DefaultAction: action,
+		BadArchAction: action,
+	}
+}
+
+// BuildStats contains information about seccomp program generation.
+type BuildStats struct {
+	// SizeBeforeOptimizations and SizeAfterOptimizations correspond to the
+	// number of instructions in the program before vs after optimization.
+	SizeBeforeOptimizations, SizeAfterOptimizations int
+
+	// BuildDuration is the amount of time it took to build the program (before
+	// BPF bytecode optimizations).
+	BuildDuration time.Duration
+
+	// RuleOptimizeDuration is the amount of time it took to run SyscallRule
+	// optimizations.
+	RuleOptimizeDuration time.Duration
+
+	// BPFOptimizeDuration is the amount of time it took to run BPF bytecode
+	// optimizations.
+	BPFOptimizeDuration time.Duration
+}
+
 // BuildProgram builds a BPF program from the given map of actions to matching
 // SyscallRules. The single generated program covers all provided RuleSets.
-func BuildProgram(rules []RuleSet, defaultAction, badArchAction linux.BPFAction) ([]linux.BPFInstruction, error) {
-	program := bpf.NewProgramBuilder()
+func BuildProgram(rules []RuleSet, options ProgramOptions) ([]bpf.Instruction, BuildStats, error) {
+	start := time.Now()
+
+	// Make a copy of the syscall rules and optimize them.
+	rulesCopy := make([]RuleSet, len(rules))
+	for i, rs := range rules {
+		rulesMap := MakeSyscallRules(make(map[uintptr]SyscallRule, len(rs.Rules.rules)))
+		for sysno, rule := range rs.Rules.rules {
+			rulesMap.rules[sysno] = optimizeSyscallRule(rule)
+		}
+		rs.Rules = rulesMap
+		rulesCopy[i] = rs
+	}
+	ruleOptimizeDuration := time.Since(start)
+
+	program := &syscallProgram{
+		program: bpf.NewProgramBuilder(),
+	}
 
 	// Be paranoid and check that syscall is done in the expected architecture.
 	//
 	// A = seccomp_data.arch
-	// if (A != AUDIT_ARCH) goto defaultAction.
-	program.AddStmt(bpf.Ld|bpf.Abs|bpf.W, seccompDataOffsetArch)
-	// defaultLabel is at the bottom of the program. The size of program
-	// may exceeds 255 lines, which is the limit of a condition jump.
-	program.AddJump(bpf.Jmp|bpf.Jeq|bpf.K, LINUX_AUDIT_ARCH, skipOneInst, 0)
-	program.AddStmt(bpf.Ret|bpf.K, uint32(badArchAction))
-	if err := buildIndex(rules, program); err != nil {
-		return nil, err
+	// if (A != AUDIT_ARCH) goto badArchLabel.
+	badArchLabel := label("badarch")
+	program.Stmt(bpf.Ld|bpf.Abs|bpf.W, seccompDataOffsetArch)
+	program.IfNot(bpf.Jmp|bpf.Jeq|bpf.K, LINUX_AUDIT_ARCH, badArchLabel)
+	if err := buildIndex(rulesCopy, program); err != nil {
+		return nil, BuildStats{}, err
 	}
 
-	// Exhausted: return defaultAction.
-	if err := program.AddLabel(defaultLabel); err != nil {
-		return nil, err
-	}
-	program.AddStmt(bpf.Ret|bpf.K, uint32(defaultAction))
+	// Default label if none of the rules matched:
+	program.Label(defaultLabel)
+	program.Ret(options.DefaultAction)
 
-	return program.Instructions()
+	// Label if the architecture didn't match:
+	program.Label(badArchLabel)
+	program.Ret(options.BadArchAction)
+
+	insns, err := program.program.Instructions()
+	if err != nil {
+		return nil, BuildStats{}, err
+	}
+	beforeOpt := len(insns)
+	buildDuration := time.Since(start) - ruleOptimizeDuration
+	insns = bpf.Optimize(insns)
+	bpfOptimizeDuration := time.Since(start) - ruleOptimizeDuration - buildDuration
+	afterOpt := len(insns)
+	log.Debugf("Seccomp program optimized from %d to %d instructions; took %v to build and %v to optimize", beforeOpt, afterOpt, buildDuration, bpfOptimizeDuration)
+	return insns, BuildStats{
+		SizeBeforeOptimizations: beforeOpt,
+		SizeAfterOptimizations:  afterOpt,
+		BuildDuration:           buildDuration,
+		RuleOptimizeDuration:    ruleOptimizeDuration,
+		BPFOptimizeDuration:     bpfOptimizeDuration,
+	}, nil
 }
 
 // buildIndex builds a BST to quickly search through all syscalls.
-func buildIndex(rules []RuleSet, program *bpf.ProgramBuilder) error {
+func buildIndex(rules []RuleSet, program *syscallProgram) error {
 	// Do nothing if rules is empty.
 	if len(rules) == 0 {
 		return nil
@@ -167,7 +410,7 @@ func buildIndex(rules []RuleSet, program *bpf.ProgramBuilder) error {
 	// with different actions. The matchers are evaluated linearly.
 	requiredSyscalls := make(map[uintptr]struct{})
 	for _, rs := range rules {
-		for sysno := range rs.Rules {
+		for sysno := range rs.Rules.rules {
 			requiredSyscalls[sysno] = struct{}{}
 		}
 	}
@@ -179,8 +422,8 @@ func buildIndex(rules []RuleSet, program *bpf.ProgramBuilder) error {
 	for _, sysno := range syscalls {
 		for _, rs := range rules {
 			// Print only if there is a corresponding set of rules.
-			if _, ok := rs.Rules[sysno]; ok {
-				log.Debugf("syscall filter %v: %s => 0x%x", SyscallName(sysno), rs.Rules[sysno], rs.Action)
+			if r, ok := rs.Rules.rules[sysno]; ok {
+				log.Debugf("syscall filter %v: %s => 0x%x", SyscallName(sysno), r, rs.Action)
 			}
 		}
 	}
@@ -191,8 +434,17 @@ func buildIndex(rules []RuleSet, program *bpf.ProgramBuilder) error {
 	// Load syscall number into A and run through BST.
 	//
 	// A = seccomp_data.nr
-	program.AddStmt(bpf.Ld|bpf.Abs|bpf.W, seccompDataOffsetNR)
-	return root.traverse(buildBSTProgram, rules, program)
+	program.Stmt(bpf.Ld|bpf.Abs|bpf.W, seccompDataOffsetNR)
+	return root.traverse(
+		buildBSTProgram,
+		knownRange{
+			lowerBoundExclusive: -1,
+			// sysno fits in 32 bits, so this is definitely out of bounds:
+			upperBoundExclusive: 1 << 32,
+		},
+		rules,
+		program,
+	)
 }
 
 // createBST converts sorted syscall slice into a balanced BST.
@@ -209,306 +461,113 @@ func createBST(syscalls []uintptr) *node {
 	return &parent
 }
 
-func vsyscallViolationLabel(ruleSetIdx int, sysno uintptr) string {
-	return fmt.Sprintf("vsyscallViolation_%v_%v", ruleSetIdx, sysno)
-}
-
-func ruleViolationLabel(ruleSetIdx int, sysno uintptr, idx int) string {
-	return fmt.Sprintf("ruleViolation_%v_%v_%v", ruleSetIdx, sysno, idx)
-}
-
-func ruleLabel(ruleSetIdx int, sysno uintptr, idx int, name string) string {
-	return fmt.Sprintf("rule_%v_%v_%v_%v", ruleSetIdx, sysno, idx, name)
-}
-
-func checkArgsLabel(sysno uintptr) string {
-	return fmt.Sprintf("checkArgs_%v", sysno)
-}
-
-// addSyscallArgsCheck adds argument checks for a single system call. It does
-// not insert a jump to the default action at the end and it is the
-// responsibility of the caller to insert an appropriate jump after calling
-// this function.
-func addSyscallArgsCheck(p *bpf.ProgramBuilder, rules []Rule, action linux.BPFAction, ruleSetIdx int, sysno uintptr) error {
-	for ruleidx, rule := range rules {
-		labelled := false
-		for i, arg := range rule {
-			if arg != nil {
-				// Break out early if using MatchAny since no further
-				// instructions are required.
-				if _, ok := arg.(MatchAny); ok {
-					continue
-				}
-
-				// Determine the data offset for low and high bits of input.
-				dataOffsetLow := seccompDataOffsetArgLow(i)
-				dataOffsetHigh := seccompDataOffsetArgHigh(i)
-				if i == RuleIP {
-					dataOffsetLow = seccompDataOffsetIPLow
-					dataOffsetHigh = seccompDataOffsetIPHigh
-				}
-
-				// Add the conditional operation. Input values to the BPF
-				// program are 64bit values.  However, comparisons in BPF can
-				// only be done on 32bit values. This means that we need to do
-				// multiple BPF comparisons in order to do one logical 64bit
-				// comparison.
-				switch a := arg.(type) {
-				case EqualTo:
-					// EqualTo checks that both the higher and lower 32bits are equal.
-					high, low := uint32(a>>32), uint32(a)
-
-					// Assert that the lower 32bits are equal.
-					// arg_low == low ? continue : violation
-					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetLow)
-					p.AddJumpFalseLabel(bpf.Jmp|bpf.Jeq|bpf.K, low, 0, ruleViolationLabel(ruleSetIdx, sysno, ruleidx))
-
-					// Assert that the lower 32bits are also equal.
-					// arg_high == high ? continue/success : violation
-					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetHigh)
-					p.AddJumpFalseLabel(bpf.Jmp|bpf.Jeq|bpf.K, high, 0, ruleViolationLabel(ruleSetIdx, sysno, ruleidx))
-					labelled = true
-				case NotEqual:
-					// NotEqual checks that either the higher or lower 32bits
-					// are *not* equal.
-					high, low := uint32(a>>32), uint32(a)
-					labelGood := fmt.Sprintf("ne%v", i)
-
-					// Check if the higher 32bits are (not) equal.
-					// arg_low == low ? continue : success
-					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetLow)
-					p.AddJumpFalseLabel(bpf.Jmp|bpf.Jeq|bpf.K, low, 0, ruleLabel(ruleSetIdx, sysno, ruleidx, labelGood))
-
-					// Assert that the lower 32bits are not equal (assuming
-					// higher bits are equal).
-					// arg_high == high ? violation : continue/success
-					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetHigh)
-					p.AddJumpTrueLabel(bpf.Jmp|bpf.Jeq|bpf.K, high, ruleViolationLabel(ruleSetIdx, sysno, ruleidx), 0)
-					p.AddLabel(ruleLabel(ruleSetIdx, sysno, ruleidx, labelGood))
-					labelled = true
-				case GreaterThan:
-					// GreaterThan checks that the higher 32bits is greater
-					// *or* that the higher 32bits are equal and the lower
-					// 32bits are greater.
-					high, low := uint32(a>>32), uint32(a)
-					labelGood := fmt.Sprintf("gt%v", i)
-
-					// Assert the higher 32bits are greater than or equal.
-					// arg_high >= high ? continue : violation (arg_high < high)
-					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetHigh)
-					p.AddJumpFalseLabel(bpf.Jmp|bpf.Jge|bpf.K, high, 0, ruleViolationLabel(ruleSetIdx, sysno, ruleidx))
-
-					// Assert that the lower 32bits are greater.
-					// arg_high == high ? continue : success (arg_high > high)
-					p.AddJumpFalseLabel(bpf.Jmp|bpf.Jeq|bpf.K, high, 0, ruleLabel(ruleSetIdx, sysno, ruleidx, labelGood))
-					// arg_low > low ? continue/success : violation (arg_high == high and arg_low <= low)
-					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetLow)
-					p.AddJumpFalseLabel(bpf.Jmp|bpf.Jgt|bpf.K, low, 0, ruleViolationLabel(ruleSetIdx, sysno, ruleidx))
-					p.AddLabel(ruleLabel(ruleSetIdx, sysno, ruleidx, labelGood))
-					labelled = true
-				case GreaterThanOrEqual:
-					// GreaterThanOrEqual checks that the higher 32bits is
-					// greater *or* that the higher 32bits are equal and the
-					// lower 32bits are greater than or equal.
-					high, low := uint32(a>>32), uint32(a)
-					labelGood := fmt.Sprintf("ge%v", i)
-
-					// Assert the higher 32bits are greater than or equal.
-					// arg_high >= high ? continue : violation (arg_high < high)
-					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetHigh)
-					p.AddJumpFalseLabel(bpf.Jmp|bpf.Jge|bpf.K, high, 0, ruleViolationLabel(ruleSetIdx, sysno, ruleidx))
-					// arg_high == high ? continue : success (arg_high > high)
-					p.AddJumpFalseLabel(bpf.Jmp|bpf.Jeq|bpf.K, high, 0, ruleLabel(ruleSetIdx, sysno, ruleidx, labelGood))
-
-					// Assert that the lower 32bits are greater (assuming the
-					// higher bits are equal).
-					// arg_low >= low ? continue/success : violation (arg_high == high and arg_low < low)
-					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetLow)
-					p.AddJumpFalseLabel(bpf.Jmp|bpf.Jge|bpf.K, low, 0, ruleViolationLabel(ruleSetIdx, sysno, ruleidx))
-					p.AddLabel(ruleLabel(ruleSetIdx, sysno, ruleidx, labelGood))
-					labelled = true
-				case LessThan:
-					// LessThan checks that the higher 32bits is less *or* that
-					// the higher 32bits are equal and the lower 32bits are
-					// less.
-					high, low := uint32(a>>32), uint32(a)
-					labelGood := fmt.Sprintf("lt%v", i)
-
-					// Assert the higher 32bits are less than or equal.
-					// arg_high > high ? violation : continue
-					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetHigh)
-					p.AddJumpTrueLabel(bpf.Jmp|bpf.Jgt|bpf.K, high, ruleViolationLabel(ruleSetIdx, sysno, ruleidx), 0)
-					// arg_high == high ? continue : success (arg_high < high)
-					p.AddJumpFalseLabel(bpf.Jmp|bpf.Jeq|bpf.K, high, 0, ruleLabel(ruleSetIdx, sysno, ruleidx, labelGood))
-
-					// Assert that the lower 32bits are less (assuming the
-					// higher bits are equal).
-					// arg_low >= low ? violation : continue
-					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetLow)
-					p.AddJumpTrueLabel(bpf.Jmp|bpf.Jge|bpf.K, low, ruleViolationLabel(ruleSetIdx, sysno, ruleidx), 0)
-					p.AddLabel(ruleLabel(ruleSetIdx, sysno, ruleidx, labelGood))
-					labelled = true
-				case LessThanOrEqual:
-					// LessThan checks that the higher 32bits is less *or* that
-					// the higher 32bits are equal and the lower 32bits are
-					// less than or equal.
-					high, low := uint32(a>>32), uint32(a)
-					labelGood := fmt.Sprintf("le%v", i)
-
-					// Assert the higher 32bits are less than or equal.
-					// assert arg_high > high ? violation : continue
-					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetHigh)
-					p.AddJumpTrueLabel(bpf.Jmp|bpf.Jgt|bpf.K, high, ruleViolationLabel(ruleSetIdx, sysno, ruleidx), 0)
-					// arg_high == high ? continue : success
-					p.AddJumpFalseLabel(bpf.Jmp|bpf.Jeq|bpf.K, high, 0, ruleLabel(ruleSetIdx, sysno, ruleidx, labelGood))
-
-					// Assert the lower bits are less than or equal (assuming
-					// the higher bits are equal).
-					// arg_low > low ? violation : success
-					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetLow)
-					p.AddJumpTrueLabel(bpf.Jmp|bpf.Jgt|bpf.K, low, ruleViolationLabel(ruleSetIdx, sysno, ruleidx), 0)
-					p.AddLabel(ruleLabel(ruleSetIdx, sysno, ruleidx, labelGood))
-					labelled = true
-				case maskedEqual:
-					// MaskedEqual checks that the bitwise AND of the value and
-					// mask are equal for both the higher and lower 32bits.
-					high, low := uint32(a.value>>32), uint32(a.value)
-					maskHigh, maskLow := uint32(a.mask>>32), uint32(a.mask)
-
-					// Assert that the lower 32bits are equal when masked.
-					// A <- arg_low.
-					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetLow)
-					// A <- arg_low & maskLow
-					p.AddStmt(bpf.Alu|bpf.And|bpf.K, maskLow)
-					// Assert that arg_low & maskLow == low.
-					p.AddJumpFalseLabel(bpf.Jmp|bpf.Jeq|bpf.K, low, 0, ruleViolationLabel(ruleSetIdx, sysno, ruleidx))
-
-					// Assert that the higher 32bits are equal when masked.
-					// A <- arg_high
-					p.AddStmt(bpf.Ld|bpf.Abs|bpf.W, dataOffsetHigh)
-					// A <- arg_high & maskHigh
-					p.AddStmt(bpf.Alu|bpf.And|bpf.K, maskHigh)
-					// Assert that arg_high & maskHigh == high.
-					p.AddJumpFalseLabel(bpf.Jmp|bpf.Jeq|bpf.K, high, 0, ruleViolationLabel(ruleSetIdx, sysno, ruleidx))
-					labelled = true
-				default:
-					return fmt.Errorf("unknown syscall rule type: %v", reflect.TypeOf(a))
-				}
-			}
-		}
-
-		// Matched, emit the given action.
-		p.AddStmt(bpf.Ret|bpf.K, uint32(action))
-
-		// Label the end of the rule if necessary. This is added for
-		// the jumps above when the argument check fails.
-		if labelled {
-			if err := p.AddLabel(ruleViolationLabel(ruleSetIdx, sysno, ruleidx)); err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
-}
-
 // buildBSTProgram converts a binary tree started in 'root' into BPF code. The outline of the code
-// is as follows:
+// is as follows, given a BST with:
 //
-// // SYS_PIPE(22), root
+//		     22
+//		    /  \
+//		   9    24
+//		  /    /  \
+//	   8   23    50
 //
-//	(A == 22) ? goto argument check : continue
-//	(A > 22) ? goto index_35 : goto index_9
+//		index_22: // SYS_PIPE(22), root
+//		(A < 22) ? goto index_9  : continue
+//		(A > 22) ? goto index_24 : continue
+//		(args OK for SYS_PIPE) ? return action : goto defaultLabel
 //
-// index_9:  // SYS_MMAP(9), leaf
+//		index_9: // SYS_MMAP(9), single child
+//		(A < 9)  ? goto index_8  : continue
+//		(A == 9) ? continue : goto defaultLabel
+//		(args OK for SYS_MMAP) ? return action : goto defaultLabel
 //
-//	A == 9) ? goto argument check : defaultLabel
+//		index_8: // SYS_LSEEK(8), leaf
+//		(A == 8) ? continue : goto defaultLabel
+//		(args OK for SYS_LSEEK) ? return action : goto defaultLabel
 //
-// index_35:  // SYS_NANOSLEEP(35), single child
+//		index_24: // SYS_SCHED_YIELD(24)
+//		(A < 24) ? goto index_23 : continue
+//		(A > 22) ? goto index_50 : continue
+//		(args OK for SYS_SCHED_YIELD) ? return action : goto defaultLabel
 //
-//	(A == 35) ? goto argument check : continue
-//	(A > 35) ? goto index_50 : goto defaultLabel
+//		index_23: // SYS_SELECT(23), leaf with parent nodes adjacent in value
+//		# Notice that we do not check for equality at all here, since we've
+//		# already established that the syscall number is 23 from the
+//		# two parent nodes that we've already traversed.
+//		# This is tracked in the `rng knownRange` argument during traversal.
+//		(args OK for SYS_SELECT) ? return action : goto defaultLabel
 //
-// index_50:  // SYS_LISTEN(50), leaf
-//
-//	(A == 50) ? goto argument check : goto defaultLabel
-func buildBSTProgram(n *node, rules []RuleSet, program *bpf.ProgramBuilder) error {
+//		index_50: // SYS_LISTEN(50), leaf
+//		(A == 50) ? continue : goto defaultLabel
+//		(args OK for SYS_LISTEN) ? return action : goto defaultLabel
+func buildBSTProgram(n *node, rng knownRange, rules []RuleSet, program *syscallProgram) error {
 	// Root node is never referenced by label, skip it.
 	if !n.root {
-		if err := program.AddLabel(n.label()); err != nil {
-			return err
-		}
+		program.Label(n.label())
 	}
-
+	nodeLabelSet := &labelSet{prefix: string(n.label())}
 	sysno := n.value
-	program.AddJumpTrueLabel(bpf.Jmp|bpf.Jeq|bpf.K, uint32(sysno), checkArgsLabel(sysno), 0)
-	if n.left == nil && n.right == nil {
-		// Leaf nodes don't require extra check.
-		program.AddDirectJumpLabel(defaultLabel)
-	} else {
-		// Non-leaf node. Check which turn to take otherwise. Using direct jumps
-		// in case that the offset may exceed the limit of a conditional jump (255)
-		program.AddJump(bpf.Jmp|bpf.Jgt|bpf.K, uint32(sysno), 0, skipOneInst)
-		program.AddDirectJumpLabel(n.right.label())
-		program.AddDirectJumpLabel(n.left.label())
+	nodeFrag := program.Record()
+	checkArgsLabel := label(fmt.Sprintf("checkArgs_%d", sysno))
+	if n.left != nil {
+		program.IfNot(bpf.Jmp|bpf.Jge|bpf.K, uint32(sysno), n.left.label())
+		rng.lowerBoundExclusive = int(sysno - 1)
 	}
-
-	if err := program.AddLabel(checkArgsLabel(sysno)); err != nil {
-		return err
+	if n.right != nil {
+		program.If(bpf.Jmp|bpf.Jgt|bpf.K, uint32(sysno), n.right.label())
+		rng.upperBoundExclusive = int(sysno + 1)
 	}
+	if rng.lowerBoundExclusive != int(sysno-1) || rng.upperBoundExclusive != int(sysno+1) {
+		// If the previous BST nodes we traversed haven't fully established
+		// that the current node's syscall value is exactly `sysno`, we still
+		// need to verify it.
+		program.IfNot(bpf.Jmp|bpf.Jeq|bpf.K, uint32(sysno), defaultLabel)
+	}
+	program.JumpTo(checkArgsLabel)
+	nodeFrag.MustHaveJumpedTo(n.left.label(), n.right.label(), checkArgsLabel, defaultLabel)
 
-	emitted := false
+	program.Label(checkArgsLabel)
+	ruleSetsFrag := program.Record()
+	possibleActions := make(map[linux.BPFAction]struct{})
 	for ruleSetIdx, rs := range rules {
-		if _, ok := rs.Rules[sysno]; ok {
-			// If there are no rules, then this will always match.
-			// Remember we've done this so that we can emit a
-			// sensible error. We can't catch all overlaps, but we
-			// can catch this one at least.
-			if emitted {
-				return fmt.Errorf("unreachable action for %v: 0x%x (rule set %d)", SyscallName(sysno), rs.Action, ruleSetIdx)
-			}
-
-			// Emit a vsyscall check if this rule requires a
-			// Vsyscall match. This rule ensures that the top bit
-			// is set in the instruction pointer, which is where
-			// the vsyscall page will be mapped.
-			if rs.Vsyscall {
-				program.AddStmt(bpf.Ld|bpf.Abs|bpf.W, seccompDataOffsetIPHigh)
-				program.AddJumpFalseLabel(bpf.Jmp|bpf.Jset|bpf.K, 0x80000000, 0, vsyscallViolationLabel(ruleSetIdx, sysno))
-			}
-
-			// Emit matchers.
-			if len(rs.Rules[sysno]) == 0 {
-				// This is a blanket action.
-				program.AddStmt(bpf.Ret|bpf.K, uint32(rs.Action))
-				emitted = true
-			} else {
-				// Add an argument check for these particular
-				// arguments. This will continue execution and
-				// check the next rule set. We need to ensure
-				// that at the very end, we insert a direct
-				// jump label for the unmatched case.
-				if err := addSyscallArgsCheck(program, rs.Rules[sysno], rs.Action, ruleSetIdx, sysno); err != nil {
-					return err
-				}
-			}
-
-			// If there was a Vsyscall check for this rule, then we
-			// need to add an appropriate label for the jump above.
-			if rs.Vsyscall {
-				if err := program.AddLabel(vsyscallViolationLabel(ruleSetIdx, sysno)); err != nil {
-					return err
-				}
-			}
+		rule, ok := rs.Rules.rules[sysno]
+		if !ok {
+			continue
 		}
-	}
+		ruleSetLabelSet := nodeLabelSet.Push(fmt.Sprintf("rs[%d]", ruleSetIdx), nodeLabelSet.NewLabel(), nodeLabelSet.NewLabel())
+		ruleSetFrag := program.Record()
 
-	// Not matched? We only need to insert a jump to the default label if
-	// not default action has been emitted for this call.
-	if !emitted {
-		program.AddDirectJumpLabel(defaultLabel)
-	}
+		// Emit a vsyscall check if this rule requires a
+		// Vsyscall match. This rule ensures that the top bit
+		// is set in the instruction pointer, which is where
+		// the vsyscall page will be mapped.
+		if rs.Vsyscall {
+			program.Stmt(bpf.Ld|bpf.Abs|bpf.W, seccompDataOffsetIPHigh)
+			program.IfNot(bpf.Jmp|bpf.Jset|bpf.K, vsyscallPageIPMask, ruleSetLabelSet.Mismatched())
+		}
 
+		// Add an argument check for these particular
+		// arguments. This will continue execution and
+		// check the next rule set. We need to ensure
+		// that at the very end, we insert a direct
+		// jump label for the unmatched case.
+		rule.Render(program, ruleSetLabelSet)
+		ruleSetFrag.MustHaveJumpedTo(ruleSetLabelSet.Matched(), ruleSetLabelSet.Mismatched())
+		program.Label(ruleSetLabelSet.Matched())
+		program.Ret(rs.Action)
+		possibleActions[rs.Action] = struct{}{}
+		ruleSetFrag.MustHaveJumpedToOrReturned(
+			[]label{ruleSetLabelSet.Mismatched()}, // Either the ruleset mismatched...
+			map[linux.BPFAction]struct{}{
+				rs.Action: struct{}{}, // ... or it returned its defined action.
+			},
+		)
+		program.Label(ruleSetLabelSet.Mismatched())
+	}
+	program.JumpTo(defaultLabel)
+	ruleSetsFrag.MustHaveJumpedToOrReturned(
+		[]label{defaultLabel}, // Either we jumped to the default label...
+		possibleActions,       // ... or we returned one of the actions of the rulesets.
+	)
 	return nil
 }
 
@@ -523,24 +582,58 @@ type node struct {
 // label returns the label corresponding to this node.
 //
 // If n is nil, then the defaultLabel is returned.
-func (n *node) label() string {
+func (n *node) label() label {
 	if n == nil {
 		return defaultLabel
 	}
-	return fmt.Sprintf("index_%v", n.value)
+	return label(fmt.Sprintf("node_%d", n.value))
 }
 
-type traverseFunc func(*node, []RuleSet, *bpf.ProgramBuilder) error
+// knownRange represents the known set of node numbers that we've
+// already checked. This is used as part of BST traversal.
+type knownRange struct {
+	lowerBoundExclusive int
+	upperBoundExclusive int
+}
 
-func (n *node) traverse(fn traverseFunc, rules []RuleSet, p *bpf.ProgramBuilder) error {
+type traverseFunc func(*node, knownRange, []RuleSet, *syscallProgram) error
+
+func (n *node) traverse(fn traverseFunc, rng knownRange, rules []RuleSet, program *syscallProgram) error {
 	if n == nil {
 		return nil
 	}
-	if err := fn(n, rules, p); err != nil {
+	if err := fn(n, rng, rules, program); err != nil {
 		return err
 	}
-	if err := n.left.traverse(fn, rules, p); err != nil {
+	if err := n.left.traverse(
+		fn,
+		knownRange{
+			lowerBoundExclusive: rng.lowerBoundExclusive,
+			upperBoundExclusive: int(n.value),
+		},
+		rules,
+		program,
+	); err != nil {
 		return err
 	}
-	return n.right.traverse(fn, rules, p)
+	return n.right.traverse(
+		fn,
+		knownRange{
+			lowerBoundExclusive: int(n.value),
+			upperBoundExclusive: rng.upperBoundExclusive,
+		},
+		rules,
+		program,
+	)
+}
+
+// DataAsBPFInput converts a linux.SeccompData to a bpf.Input.
+// It uses `buf` as scratch buffer; this buffer must be wide enough
+// to accommodate a mashaled version of `d`.
+func DataAsBPFInput(d *linux.SeccompData, buf []byte) bpf.Input {
+	if len(buf) < d.SizeBytes() {
+		panic(fmt.Sprintf("buffer must be at least %d bytes long", d.SizeBytes()))
+	}
+	d.MarshalUnsafe(buf)
+	return buf[:d.SizeBytes()]
 }

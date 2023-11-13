@@ -121,7 +121,7 @@ type MemoryFile struct {
 	// file blocks expected. This is used to elide the scan when this
 	// matches the underlying file blocks.
 	//
-	// To track swapped pages, usageSwapped tracks the discrepency between
+	// To track swapped pages, usageSwapped tracks the discrepancy between
 	// what is observed in core and what is reported by the file. When
 	// usageSwapped is non-zero, a sweep will be performed at least every
 	// second. The start of the last sweep is recorded in usageLast.
@@ -866,6 +866,27 @@ func (f *MemoryFile) markDecommitted(fr memmap.FileRange) {
 	f.usage.MergeRange(fr)
 }
 
+// HasUniqueRef returns true if all pages in the given range have exactly one
+// reference. A return value of false is inherently racy, but if the caller
+// holds a reference on the given range and is preventing other goroutines from
+// copying it, then a return value of true is not racy.
+//
+// Preconditions: At least one reference must be held on all pages in fr.
+func (f *MemoryFile) HasUniqueRef(fr memmap.FileRange) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	seg := f.usage.FindSegment(fr.Start)
+	for {
+		if seg.ValuePtr().refs != 1 {
+			return false
+		}
+		seg = seg.NextSegment()
+		if !seg.Ok() || fr.End <= seg.Start() {
+			return true
+		}
+	}
+}
+
 // IncRef implements memmap.File.IncRef.
 func (f *MemoryFile) IncRef(fr memmap.FileRange, memCgID uint32) {
 	if !fr.WellFormed() || fr.Length() == 0 || fr.Start%hostarch.PageSize != 0 || fr.End%hostarch.PageSize != 0 {
@@ -1088,10 +1109,10 @@ func (f *MemoryFile) ShouldCacheEvictable() bool {
 }
 
 // UpdateUsage ensures that the memory usage statistics in
-// usage.MemoryAccounting are up to date. If forceScan is true, the
-// UsageScanDuration is ignored and the memory file is scanned to get the
-// memory usage.
-func (f *MemoryFile) UpdateUsage(memCgID uint32) error {
+// usage.MemoryAccounting are up to date. If memCgIDs is nil, all the pages
+// will be scanned. Else only the pages which belong to the memory cgroup ids
+// in memCgIDs will be scanned and the memory usage will be updated.
+func (f *MemoryFile) UpdateUsage(memCgIDs map[uint32]struct{}) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -1120,10 +1141,10 @@ func (f *MemoryFile) UpdateUsage(memCgID uint32) error {
 		return nil
 	}
 
-	if memCgID == 0 {
+	if memCgIDs == nil {
 		f.usageLast = time.Now()
 	}
-	err = f.updateUsageLocked(currentUsage, memCgID, mincore)
+	err = f.updateUsageLocked(currentUsage, memCgIDs, mincore)
 	log.Debugf("UpdateUsage: currentUsage=%d, usageExpected=%d, usageSwapped=%d.",
 		currentUsage, f.usageExpected, f.usageSwapped)
 	log.Debugf("UpdateUsage: took %v.", time.Since(f.usageLast))
@@ -1136,7 +1157,7 @@ func (f *MemoryFile) UpdateUsage(memCgID uint32) error {
 //
 // Precondition: f.mu must be held; it may be unlocked and reacquired.
 // +checklocks:f.mu
-func (f *MemoryFile) updateUsageLocked(currentUsage uint64, memCgID uint32, checkCommitted func(bs []byte, committed []byte) error) error {
+func (f *MemoryFile) updateUsageLocked(currentUsage uint64, memCgIDs map[uint32]struct{}, checkCommitted func(bs []byte, committed []byte) error) error {
 	// Track if anything changed to elide the merge. In the common case, we
 	// expect all segments to be committed and no merge to occur.
 	changedAny := false
@@ -1183,10 +1204,12 @@ func (f *MemoryFile) updateUsageLocked(currentUsage uint64, memCgID uint32, chec
 		// Scan the pages of the given memCgID only. This will avoid scanning the
 		// whole memory file when the memory usage is required only for a specific
 		// cgroup. The total memory usage of all cgroups can be obtained when the
-		// memCgID is passed as zero.
-		if memCgID != 0 && seg.ValuePtr().memCgID != memCgID {
-			seg = seg.NextSegment()
-			continue
+		// memCgIDs is nil.
+		if memCgIDs != nil {
+			if _, ok := memCgIDs[seg.ValuePtr().memCgID]; !ok {
+				seg = seg.NextSegment()
+				continue
+			}
 		}
 
 		// Get the range for this segment. As we touch slices, the

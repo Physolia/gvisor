@@ -54,6 +54,9 @@ type MountNamespace struct {
 
 	// mounts is the total number of mounts in this mount namespace.
 	mounts uint32
+
+	// pending is the total number of pending mounts in this mount namespace.
+	pending uint32
 }
 
 // Namespace is the namespace interface.
@@ -142,10 +145,6 @@ func (vfs *VirtualFilesystem) updateRootAndCWD(ctx context.Context, root *Virtua
 		cwd.mount = dst
 		cwd.mount.IncRef()
 	}
-	for srcChild := range src.children {
-		dstChild := vfs.mounts.Lookup(dst, srcChild.point())
-		vfs.updateRootAndCWD(ctx, root, cwd, srcChild, dstChild)
-	}
 }
 
 // NamespaceInodeGetter is an interface that provides the GetNamespaceInode method.
@@ -174,16 +173,21 @@ func (vfs *VirtualFilesystem) CloneMountNamespace(
 	vfs.lockMounts()
 	defer vfs.unlockMounts(ctx)
 
-	newRoot, err := vfs.cloneMountTree(ctx, ns.root, ns.root.root)
+	cloneType := 0
+	if ns.Owner != newns.Owner {
+		cloneType = sharedToFollowerClone
+	}
+	newRoot, err := vfs.cloneMountTree(ctx, ns.root, ns.root.root, cloneType,
+		func(ctx context.Context, src, dst *Mount) {
+			vfs.updateRootAndCWD(ctx, root, cwd, src, dst) // +checklocksforce: vfs.mountMu is locked.
+		})
 	if err != nil {
 		newns.DecRef(ctx)
-		vfs.abortTree(ctx, newRoot)
 		return nil, err
 	}
 	newns.root = newRoot
 	newns.root.ns = newns
-	vfs.commitPendingTree(ctx, newRoot)
-	vfs.updateRootAndCWD(ctx, root, cwd, ns.root, newns.root)
+	vfs.commitChildren(ctx, newRoot)
 	return newns, nil
 }
 
@@ -240,4 +244,19 @@ func (mntns *MountNamespace) Root(ctx context.Context) VirtualDentry {
 	vd.dentry = m.root
 	vd.dentry.IncRef()
 	return vd
+}
+
+func (mntns *MountNamespace) checkMountCount(ctx context.Context, mnt *Mount) error {
+	if mntns.mounts > MountMax {
+		return linuxerr.ENOSPC
+	}
+	if mntns.mounts+mntns.pending > MountMax {
+		return linuxerr.ENOSPC
+	}
+	mnts := mnt.countSubmountsLocked()
+	if mntns.mounts+mntns.pending+mnts > MountMax {
+		return linuxerr.ENOSPC
+	}
+	mntns.pending += mnts
+	return nil
 }

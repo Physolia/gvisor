@@ -81,14 +81,17 @@ type Boot struct {
 	// ioFDs is the list of FDs used to connect to FS gofers.
 	ioFDs intFlags
 
-	// overlayFilestoreFDs are FDs to the regular files that will back the tmpfs
-	// upper mount in the overlay mounts.
-	overlayFilestoreFDs intFlags
+	// devIoFD is the FD to connect to dev gofer.
+	devIoFD int
 
-	// overlayMediums contains information about how the gofer mounts have been
-	// overlaid. The first entry is for rootfs and the following entries are for
-	// bind mounts in Spec.Mounts (in the same order).
-	overlayMediums boot.OverlayMediumFlags
+	// goferFilestoreFDs are FDs to the regular files that will back the tmpfs or
+	// overlayfs mount for certain gofer mounts.
+	goferFilestoreFDs intFlags
+
+	// goferMountConfs contains information about how the gofer mounts have been
+	// configured. The first entry is for rootfs and the following entries are
+	// for bind mounts in Spec.Mounts (in the same order).
+	goferMountConfs boot.GoferMountConfFlags
 
 	// stdioFDs are the fds for stdin, stdout, and stderr. They must be
 	// provided in that order.
@@ -125,7 +128,9 @@ type Boot struct {
 
 	// mountsFD is the file descriptor to read list of mounts after they have
 	// been resolved (direct paths, no symlinks). They are resolved outside the
-	// sandbox (e.g. gofer) and sent through this FD.
+	// sandbox (e.g. gofer) and sent through this FD. When mountsFD is not
+	// provided, there is no cleaning required for mounts and the mounts in
+	// the spec can be used as is.
 	mountsFD int
 
 	podInitConfigFD int
@@ -156,9 +161,8 @@ type Boot struct {
 	// used to synchronize rootless user namespace initialization.
 	syncUsernsFD int
 
-	// nvidiaDevMinors is a list of device minors for Nvidia GPU devices exposed
-	// to the sandbox.
-	nvidiaDevMinors boot.NvidiaDevMinors
+	// nvidiaDriverVersion is the Nvidia driver version on the host.
+	nvidiaDriverVersion string
 }
 
 // Name implements subcommands.Command.Name.
@@ -189,23 +193,24 @@ func (b *Boot) SetFlags(f *flag.FlagSet) {
 	f.Uint64Var(&b.totalHostMem, "total-host-memory", 0, "total memory reported by host /proc/meminfo")
 	f.BoolVar(&b.attached, "attached", false, "if attached is true, kills the sandbox process when the parent process terminates")
 	f.StringVar(&b.productName, "product-name", "", "value to show in /sys/devices/virtual/dmi/id/product_name")
+	f.StringVar(&b.nvidiaDriverVersion, "nvidia-driver-version", "", "Nvidia driver version on the host")
 
 	// Open FDs that are donated to the sandbox.
 	f.IntVar(&b.specFD, "spec-fd", -1, "required fd with the container spec")
 	f.IntVar(&b.controllerFD, "controller-fd", -1, "required FD of a stream socket for the control server that must be donated to this process")
 	f.IntVar(&b.deviceFD, "device-fd", -1, "FD for the platform device file")
-	f.Var(&b.ioFDs, "io-fds", "list of FDs to connect gofer clients. They must follow this order: root first, then mounts as defined in the spec")
+	f.Var(&b.ioFDs, "io-fds", "list of image FDs and/or socket FDs to connect gofer clients. They must follow this order: root first, then mounts as defined in the spec")
+	f.IntVar(&b.devIoFD, "dev-io-fd", -1, "FD to connect dev gofer client")
 	f.Var(&b.stdioFDs, "stdio-fds", "list of FDs containing sandbox stdin, stdout, and stderr in that order")
 	f.Var(&b.passFDs, "pass-fd", "mapping of host to guest FDs. They must be in M:N format. M is the host and N the guest descriptor.")
 	f.IntVar(&b.execFD, "exec-fd", -1, "host file descriptor used for program execution.")
-	f.Var(&b.overlayFilestoreFDs, "overlay-filestore-fds", "FDs to the regular files that will back the tmpfs upper mount in the overlay mounts.")
-	f.Var(&b.overlayMediums, "overlay-mediums", "information about how the gofer mounts have been overlaid.")
+	f.Var(&b.goferFilestoreFDs, "gofer-filestore-fds", "FDs to the regular files that will back the overlayfs or tmpfs mount if a gofer mount is to be overlaid.")
+	f.Var(&b.goferMountConfs, "gofer-mount-confs", "information about how the gofer mounts have been configured.")
 	f.IntVar(&b.userLogFD, "user-log-fd", 0, "file descriptor to write user logs to. 0 means no logging.")
 	f.IntVar(&b.startSyncFD, "start-sync-fd", -1, "required FD to used to synchronize sandbox startup")
-	f.IntVar(&b.mountsFD, "mounts-fd", -1, "mountsFD is the file descriptor to read list of mounts after they have been resolved (direct paths, no symlinks).")
+	f.IntVar(&b.mountsFD, "mounts-fd", -1, "mountsFD is an optional file descriptor to read list of mounts after they have been resolved (direct paths, no symlinks).")
 	f.IntVar(&b.podInitConfigFD, "pod-init-config-fd", -1, "file descriptor to the pod init configuration file.")
 	f.Var(&b.sinkFDs, "sink-fds", "ordered list of file descriptors to be used by the sinks defined in --pod-init-config.")
-	f.Var(&b.nvidiaDevMinors, "nvidia-dev-minors", "list of device minors for Nvidia GPU devices exposed to the sandbox.")
 
 	// Profiling flags.
 	b.profileFDs.SetFromFlags(f)
@@ -266,7 +271,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 	}
 
 	if b.setUpRoot {
-		if err := setUpChroot(b.pidns, spec, conf, b.nvidiaDevMinors); err != nil {
+		if err := setUpChroot(b.pidns, spec, conf); err != nil {
 			util.Fatalf("error setting up chroot: %v", err)
 		}
 		argOverride["setup-root"] = "false"
@@ -378,15 +383,18 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		}
 	}
 
-	// Read resolved mount list and replace the original one from the spec.
-	mountsFile := os.NewFile(uintptr(b.mountsFD), "mounts file")
-	cleanMounts, err := specutils.ReadMounts(mountsFile)
-	if err != nil {
+	// When mountsFD is not provided, there is no cleaning required.
+	if b.mountsFD >= 0 {
+		// Read resolved mount list and replace the original one from the spec.
+		mountsFile := os.NewFile(uintptr(b.mountsFD), "mounts file")
+		cleanMounts, err := specutils.ReadMounts(mountsFile)
+		if err != nil {
+			mountsFile.Close()
+			util.Fatalf("Error reading mounts file: %v", err)
+		}
 		mountsFile.Close()
-		util.Fatalf("Error reading mounts file: %v", err)
+		spec.Mounts = cleanMounts
 	}
-	mountsFile.Close()
-	spec.Mounts = cleanMounts
 
 	if conf.DirectFS {
 		// sandbox should run with a umask of 0, because we want to preserve file
@@ -420,11 +428,12 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		ControllerFD:        b.controllerFD,
 		Device:              os.NewFile(uintptr(b.deviceFD), "platform device"),
 		GoferFDs:            b.ioFDs.GetArray(),
+		DevGoferFD:          b.devIoFD,
 		StdioFDs:            b.stdioFDs.GetArray(),
 		PassFDs:             b.passFDs.GetArray(),
 		ExecFD:              b.execFD,
-		OverlayFilestoreFDs: b.overlayFilestoreFDs.GetArray(),
-		OverlayMediums:      b.overlayMediums.GetArray(),
+		GoferFilestoreFDs:   b.goferFilestoreFDs.GetArray(),
+		GoferMountConfs:     b.goferMountConfs.GetArray(),
 		NumCPU:              b.cpuNum,
 		TotalMem:            b.totalMem,
 		TotalHostMem:        b.totalHostMem,
@@ -433,6 +442,7 @@ func (b *Boot) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcomma
 		PodInitConfigFD:     b.podInitConfigFD,
 		SinkFDs:             b.sinkFDs.GetArray(),
 		ProfileOpts:         b.profileFDs.ToOpts(),
+		NvidiaDriverVersion: b.nvidiaDriverVersion,
 	}
 	l, err := boot.New(bootArgs)
 	if err != nil {

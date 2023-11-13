@@ -43,6 +43,7 @@ import (
 const (
 	annotationFlagPrefix            = "dev.gvisor.flag."
 	annotationSeccomp               = "dev.gvisor.internal.seccomp."
+	annotationTPU                   = "dev.gvisor.internal.tpuproxy"
 	annotationSeccompRuntimeDefault = "RuntimeDefault"
 
 	annotationContainerName = "io.kubernetes.cri.container-name"
@@ -285,6 +286,27 @@ func ReadMounts(f *os.File) ([]specs.Mount, error) {
 		return nil, fmt.Errorf("error unmarshaling mounts: %v\nJSON bytes:\n%s", err, string(bytes))
 	}
 	return mounts, nil
+}
+
+// ChangeMountType changes m.Type to the specified type. It may do necessary
+// amends to m.Options.
+func ChangeMountType(m *specs.Mount, newType string) {
+	m.Type = newType
+
+	// OCI spec allows bind mounts to be specified in options only. So if new type
+	// is not bind, remove bind/rbind from options.
+	//
+	// "For bind mounts (when options include either bind or rbind), the type is
+	// a dummy, often "none" (not listed in /proc/filesystems)."
+	if newType != "bind" {
+		newOpts := make([]string, 0, len(m.Options))
+		for _, opt := range m.Options {
+			if opt != "rbind" && opt != "bind" {
+				newOpts = append(newOpts, opt)
+			}
+		}
+		m.Options = newOpts
+	}
 }
 
 // Capabilities takes in spec and returns a TaskCapabilities corresponding to
@@ -545,6 +567,22 @@ func IsDebugCommand(conf *config.Config, command string) bool {
 		}
 	}
 	return !rv
+}
+
+// TPUProxyIsEnabled checks if tpuproxy is enabled in the config or annotations.
+func TPUProxyIsEnabled(spec *specs.Spec, conf *config.Config) bool {
+	if conf.TPUProxy {
+		return true
+	}
+	val, ok := spec.Annotations[annotationTPU]
+	if ok {
+		ret, err := strconv.ParseBool(val)
+		if val != "" && err != nil {
+			log.Warningf("tpuproxy annotation set to invalid value %q. Skipping.", val)
+		}
+		return ret
+	}
+	return false
 }
 
 // SafeSetupAndMount creates the mount point and calls Mount with the given
